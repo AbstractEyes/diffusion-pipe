@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
+from utils.parquet_cache import ParquetCache
 import comfy.model_management as mm
 
 
@@ -81,14 +82,37 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
+def make_cache(cache_dir, fingerprint, dataset_config):
+    '''Factory selecting the cache backend from the dataset config.
+
+    'legacy' (default) -> utils.cache.Cache (sqlite + torch.save binary shards).
+    'parquet'          -> utils.parquet_cache.ParquetCache (multi-column parquet shards,
+                          HF-uploadable). Both expose an identical API, so the read path
+                          and DatasetManager are unchanged.
+    '''
+    backend = (dataset_config or {}).get('cache_backend', 'legacy')
+    if backend == 'legacy':
+        return Cache(cache_dir, fingerprint, shard_size_gb=10)
+    elif backend == 'parquet':
+        return ParquetCache(
+            cache_dir,
+            fingerprint,
+            shard_size_mb=(dataset_config or {}).get('cache_shard_size_mb', 350),
+            hf_repo=(dataset_config or {}).get('cache_hf_repo', None),
+            hf_upload=(dataset_config or {}).get('cache_hf_upload', False),
+            row_group_size=(dataset_config or {}).get('cache_row_group_size', 64),
+        )
+    raise ValueError(f"Unknown cache_backend: {backend!r} (expected 'legacy' or 'parquet')")
+
+
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, dataset_config=None):
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
-    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
+    cache = make_cache(cache_dir, new_fingerprint, dataset_config)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -174,7 +198,7 @@ class TextEmbeddingDataset:
         return self.te_dataset[self.image_spec_to_te_idx[image_spec][caption_number]]
 
 
-def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size):
+def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_cache, caching_batch_size, dataset_config=None):
 
     def flatten_captions(example):
         result = {key: [] for key in example}
@@ -196,6 +220,7 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         new_fingerprint_args=[i],
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
+        dataset_config=dataset_config,
     )
     assert len(te_dataset) == len(flattened_captions)
     return TextEmbeddingDataset(te_dataset, flattened_captions)
@@ -215,6 +240,7 @@ class SizeBucketDataset:
         self.path = Path(self.directory_config['path'])
         self.cache_dir = cache_base / f'cache_{bucket_suffix(size_bucket)}'
         self.captions_dict = directory_dataset.captions_dict  # optional
+        self.dataset_config = directory_dataset.dataset_config  # for cache backend selection
 
         if len(size_bucket) == 4:
             # rename old folder name to the new one for convenience
@@ -239,6 +265,7 @@ class SizeBucketDataset:
             cache_file_prefix='latents_',
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
+            dataset_config=self.dataset_config,
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
@@ -299,7 +326,7 @@ class SizeBucketDataset:
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         print(f'caching text embeddings: {self.size_bucket}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size, dataset_config=self.dataset_config)
         self.text_embedding_datasets.append(te_dataset)
 
     def add_text_embedding_dataset(self, te_dataset):
@@ -439,7 +466,7 @@ class ARBucketDataset:
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         print(f'caching text embeddings: {self.ar_frames}')
-        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size)
+        te_dataset = _cache_text_embeddings(self.metadata_dataset, map_fn, i, self.cache_dir, regenerate_cache, caching_batch_size, dataset_config=self.directory_dataset.dataset_config)
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
@@ -914,6 +941,7 @@ class DirectoryDataset:
             cache_dir=self.cache_dir,
             cache_file_prefix=f'uncond_text_embeddings_{i}_',
             regenerate_cache=regenerate_cache,
+            dataset_config=self.dataset_config,
         )
         for size_bucket_ds in self.get_size_bucket_datasets():
             size_bucket_ds.uncond_text_embeddings.append(uncond_text_embeddings_ds)
