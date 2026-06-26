@@ -36,6 +36,13 @@ model_management.in_training = True
 # worker during latent caching. Set from the dataset config by ParquetDirectoryDataset.
 PARQUET_SHARD_LRU = 8
 
+# When True, latent caching decodes images to uint8 on CPU workers and does the
+# (batched) resize+crop+normalize on the GPU rank just before the VAE. Set from
+# the dataset config (resize_on_gpu) by Dataset.__init__. Default off => CPU PIL
+# resize (the correctness baseline). Changes the latents cache fingerprint so GPU
+# and CPU caches never clobber each other.
+RESIZE_ON_GPU = False
+
 
 def make_contiguous(*tensors):
     return tuple(x.contiguous() for x in tensors)
@@ -65,19 +72,9 @@ def extract_clips(video, target_frames, video_clip_mode):
         raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
 
 
-def convert_crop_and_resize(pil_img, width_and_height):
-    if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
-        pil_img = pil_img.convert('RGBA')
-
-    # add white background for transparent images
-    if pil_img.mode == 'RGBA':
-        canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
-        canvas.alpha_composite(pil_img)
-        pil_img = canvas.convert('RGB')
-    else:
-        pil_img = pil_img.convert('RGB')
-
-    return ImageOps.fit(pil_img, width_and_height)
+# Image preprocessing helpers live in utils.image_resize (dependency-light, so the
+# CPU/GPU resize equivalence is unit-testable without the full training stack).
+from utils.image_resize import composite_to_rgb, convert_crop_and_resize, pil_to_uint8_chw, gpu_resize_batch  # noqa: E402
 
 
 class PreprocessMediaFile:
@@ -96,6 +93,18 @@ class PreprocessMediaFile:
             assert self.framerate
         self.tarfile_map = {}
         self.parquet_reader = None  # lazily created on first parquet image_spec
+        # GPU-resize mode: this preprocessor returns uint8 originals; resize happens
+        # on the GPU rank. Only applies to images (video keeps the CPU path).
+        self.resize_on_gpu = RESIZE_ON_GPU
+
+    def compute_resize_wh(self, size_bucket):
+        '''Target (width, height) for a size bucket, matching the CPU resize path.
+        Used by the caching code to drive GPU resize.'''
+        assert size_bucket is not None, 'resize_on_gpu requires a size bucket'
+        sbw, sbh, _ = size_bucket
+        h = round_to_nearest_multiple(sbh, self.round_height)
+        w = round_to_nearest_multiple(sbw, self.round_width)
+        return (w, h)
 
     def __del__(self):
         for tar_f in self.tarfile_map.values():
@@ -159,6 +168,15 @@ class PreprocessMediaFile:
             mask = torchvision.transforms.functional.to_tensor(mask_img)[0].to(torch.float16)  # use first channel
         else:
             mask = None
+
+        if self.resize_on_gpu and not is_video:
+            # Decode + composite on CPU (no CUDA in forked workers); the GPU rank
+            # resizes/crops/normalizes this uint8 original just before the VAE. Mask
+            # stays on the proven CPU path (already resized to resize_wh above).
+            u8 = pil_to_uint8_chw(composite_to_rgb(pil_img))
+            if hasattr(filepath_or_file, 'close'):
+                filepath_or_file.close()
+            return [(u8, mask)]
 
         resized_video = torch.empty((num_frames, 3, height_rounded, width_rounded))
         for i, frame in enumerate(video):

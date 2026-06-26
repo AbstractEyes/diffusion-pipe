@@ -258,11 +258,15 @@ class SizeBucketDataset:
 
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
+        # Only perturb the latents fingerprint when GPU resize is on, so existing
+        # CPU-resized caches stay valid after upgrading, and GPU/CPU caches never mix.
+        latents_fingerprint_args = ['gpu_resize'] if self.dataset_config.get('resize_on_gpu', False) else None
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
             map_fn,
             self.cache_dir,
             cache_file_prefix='latents_',
+            new_fingerprint_args=latents_fingerprint_args,
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
             dataset_config=self.dataset_config,
@@ -1057,6 +1061,10 @@ class Dataset:
         self.dataset_config = dataset_config
         self.model = model
         self.model_name = self.model.name
+        # Propagate the (dataset-level) GPU-resize flag to PreprocessMediaFile, which
+        # is constructed later by the model. Applies to all directory types.
+        import models.base as base_module
+        base_module.RESIZE_ON_GPU = dataset_config.get('resize_on_gpu', False)
         # TODO: remove. Doing this because Wan and Cosmos-Predict2 use the same latents.
         # if self.model_name == 'wan' and len(self.model.get_text_encoders()) == 0:
         #     self.model_name = 'cosmos_predict2'
@@ -1197,6 +1205,9 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 
     pipes = {}
 
+    resize_on_gpu = getattr(preprocess_media_file_fn, 'resize_on_gpu', False)
+    add_frame_dim = getattr(preprocess_media_file_fn, 'support_video', False)
+
     def latents_map_fn(example, rank):
         is_edit_dataset = ('control_file' in example)
         first_size_bucket = example['size_bucket'][0]
@@ -1225,15 +1236,28 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             assert not is_edit_dataset
             return {'latents': [], 'mask': [], 'image_spec': [], 'caption': []}
 
+        if resize_on_gpu and is_edit_dataset:
+            raise NotImplementedError('resize_on_gpu does not support edit/control datasets yet')
+        # In GPU-resize mode the preprocessor returns uint8 originals of differing
+        # sizes that can't be pre-stacked; send them as a list + a target so the GPU
+        # rank resizes/crops/normalizes just before the VAE.
+        gpu_resize_target = None
+        if resize_on_gpu:
+            tw, th = preprocess_media_file_fn.compute_resize_wh(first_size_bucket)
+            gpu_resize_target = (tw, th, add_frame_dim)
+
         caching_batch_size = len(example['image_spec'])
         results = defaultdict(list)
         for i in range(0, len(tensors_and_masks), caching_batch_size):
-            tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
+            if resize_on_gpu:
+                payload = [t[0] for t in tensors_and_masks[i:i+caching_batch_size]]  # list of uint8 (C,H,W)
+            else:
+                payload = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
             c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
-            queue.put((0, tensor, c_tensor, child_conn))
+            queue.put((0, payload, c_tensor, child_conn, gpu_resize_target))
             result = parent_conn.recv()  # dict
             for k, v in result.items():
                 results[k].append(v)
@@ -1366,7 +1390,15 @@ class DatasetManager:
             # ComfyUI model in a wrapper class that delays loading until the model is needed.
             self.submodels[id].load_model_if_needed()
         if id == 0:
-            tensor, control_tensor, pipe = task[1:]
+            payload, control_tensor, pipe, gpu_resize_target = task[1:]
+            if gpu_resize_target is not None:
+                # GPU-resize mode: payload is a list of variable-size uint8 (C,H,W)
+                # CPU tensors; resize/crop/normalize on the GPU just before the VAE.
+                from utils.image_resize import gpu_resize_batch
+                target_w, target_h, add_frame_dim = gpu_resize_target
+                tensor = gpu_resize_batch(payload, target_w, target_h, add_frame_dim, device='cuda')
+            else:
+                tensor = payload
             if control_tensor is not None:
                 # edit dataset
                 results = self.call_vae_fn(tensor, control_tensor)
