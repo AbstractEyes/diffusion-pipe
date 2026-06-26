@@ -982,6 +982,12 @@ class ParquetDirectoryDataset(DirectoryDataset):
     def __init__(self, directory_config, dataset_config, model_name, framerate=None, round_to_multiple=32, skip_dataset_validation=False):
         from utils.parquet_source import resolve_parquet_source
         self.source = resolve_parquet_source(directory_config, num_proc=NUM_PROC)
+        # Optional generic bucket/repeat manifest (e.g. produced by a subject-bucketing
+        # pass). Not part of the upstream PR; no effect unless 'bucket_manifest' is set.
+        self.bucket_manifest = None
+        if directory_config.get('bucket_manifest'):
+            from utils.bucket_manifest import load_bucket_manifest
+            self.bucket_manifest = load_bucket_manifest(directory_config['bucket_manifest'])
         # Inject a stable, writable cache root before super().__init__ (which checks
         # that path exists and runs validate()). Users may override via `path`.
         if not directory_config.get('path'):
@@ -1012,6 +1018,13 @@ class ParquetDirectoryDataset(DirectoryDataset):
                     n_skipped_caption += 1
                     continue
                 captions = ['']
+            # Per-row repeats from an optional bucket manifest: replicate the caption
+            # list so the row gets that many iteration-order entries (the image is still
+            # cached/encoded only once). No-op when no manifest is configured.
+            if self.bucket_manifest is not None:
+                repeats = self.bucket_manifest.repeats_for(row.get('key'))
+                if repeats > 1:
+                    captions = captions * repeats
             w, h = row['width'], row['height']
             if w is None or h is None or w <= 0 or h <= 0:
                 n_skipped_bucket += 1

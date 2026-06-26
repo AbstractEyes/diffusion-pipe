@@ -132,7 +132,7 @@ def extract_caption(raw_value, caption_type='text', json_path=None):
 
 class ParquetSource:
     def __init__(self, shard_paths, image_column, width_column, height_column,
-                 caption_columns, caption_type, caption_json_path):
+                 caption_columns, caption_type, caption_json_path, key_column=None):
         self.shard_paths = shard_paths
         self.image_column = image_column
         self.width_column = width_column
@@ -140,6 +140,7 @@ class ParquetSource:
         self.caption_columns = caption_columns
         self.caption_type = caption_type
         self.caption_json_path = caption_json_path
+        self.key_column = key_column  # optional stable row key (for bucket manifests)
 
 
 def _dedup(seq):
@@ -163,6 +164,8 @@ def resolve_parquet_source(directory_config, num_proc=4):
     caption_columns = [caption_column] if isinstance(caption_column, str) else list(caption_column)
     caption_type = directory_config.get('caption_type', 'text')
     caption_json_path = directory_config.get('caption_json_path', None)
+    # Only read a key column when a bucket manifest is configured (else it's unused).
+    key_column = directory_config.get('manifest_key_column', 'id') if directory_config.get('bucket_manifest') else None
 
     if t == 'huggingface':
         from huggingface_hub import snapshot_download
@@ -213,7 +216,7 @@ def resolve_parquet_source(directory_config, num_proc=4):
         raise ValueError(f'Unknown parquet source type {t!r} (expected "huggingface" or "parquet")')
 
     return ParquetSource(shards, image_column, width_column, height_column,
-                         caption_columns, caption_type, caption_json_path)
+                         caption_columns, caption_type, caption_json_path, key_column=key_column)
 
 
 def iter_parquet_rows(source):
@@ -222,15 +225,17 @@ def iter_parquet_rows(source):
     (shard, row) order; row_in_shard is the shard-relative index used by the
     image_spec so ParquetImageReader can fetch the cell.'''
     cap_cols = source.caption_columns
+    key_col = source.key_column
     for shard in source.shard_paths:
         pf = pq.ParquetFile(shard)
-        cols = _dedup([source.width_column, source.height_column] + cap_cols)
+        cols = _dedup([source.width_column, source.height_column] + cap_cols + ([key_col] if key_col else []))
         row_in_shard = 0
         for rg in range(pf.num_row_groups):
             tbl = pf.read_row_group(rg, columns=cols)
             w = tbl.column(source.width_column).to_pylist()
             h = tbl.column(source.height_column).to_pylist()
             capdata = {c: tbl.column(c).to_pylist() for c in cap_cols}
+            keydata = tbl.column(key_col).to_pylist() if key_col else None
             for r in range(len(w)):
                 captions = []
                 for c in cap_cols:
@@ -244,6 +249,7 @@ def iter_parquet_rows(source):
                     'width': w[r],
                     'height': h[r],
                     'captions': captions,
+                    'key': keydata[r] if keydata is not None else None,
                 }
                 row_in_shard += 1
 

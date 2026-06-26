@@ -13,6 +13,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2026-06-26
+  - Train directly from parquet / HuggingFace datasets, and optionally store the latent/text-embedding cache as HF-uploadable multi-column parquet shards. Opt-in and model-agnostic; the legacy folder dataset and binary cache are unchanged. See the [Parquet / HuggingFace datasets](#parquet--huggingface-datasets-and-the-parquet-cache-backend) section.
 - 2026-06-24
   - Support Krea 2.
 - 2026-06-07
@@ -150,6 +152,38 @@ Latents and text embeddings are cached to disk before training happens. This way
 This caching also means that training LoRAs for text encoders is not currently supported.
 
 Three flags are relevant for caching. ```--cache_only``` does the caching flow, then exits without training anything. ```--regenerate_cache``` forces cache regeneration. ```--trust_cache``` will blindly load the cached metadata files, without checking if any data files have changed via the fingerprint. This can speed up loading for very large datasets (100,000+ images), but you must make sure nothing in the dataset has changed.
+
+## Parquet / HuggingFace datasets and the parquet cache backend
+In addition to folders of image+caption files, you can train directly from a prepared **parquet** dataset (local files or a HuggingFace dataset repo), and you can store the computed latent/text-embedding cache as **multi-column parquet shards** that are easy to back up to (and restore from) the HuggingFace Hub. Both are opt-in and model-agnostic; the legacy folder format and binary cache are unchanged and remain the default. See [examples/anima_hf_parquet_dataset.toml](./examples/anima_hf_parquet_dataset.toml) for a fully commented config.
+
+**Parquet / HF input source** — set `type` on a `[[directory]]`:
+```toml
+[[directory]]
+type = 'huggingface'                                  # or 'parquet' for local files
+dataset = 'AbstractPhil/diffusion-pretrain-set-ft1'   # HF repo id (type='huggingface')
+config = 'deepfashion'
+split = 'train'
+# parquet_files = '/data/my_dataset/*.parquet'        # instead, for type='parquet'
+image_column = 'image'                                # HF Image feature (struct<bytes, path>)
+width_column = 'image_width'                          # int columns => aspect-ratio bucketing
+height_column = 'image_height'                        # with NO image decoding (the slow part)
+caption_column = 'caption_vlm_json'                   # a column, or a list of columns for multi-prompt
+caption_type = 'json'                                 # 'text' (verbatim) or 'json' (parse + flatten)
+# caption_json_path = 'deepfashion_caption'           # dot-path into the JSON, optional
+num_repeats = 1
+```
+Aspect-ratio buckets are computed vectorized from the width/height columns, so no image is decoded just to read its size. Image pixels are decoded lazily from the parquet only during latent caching (never materialized to files on disk). On Colab, set `map_num_proc = 1` in the training config.
+
+**Parquet cache backend** — set these at the top of the dataset config:
+```toml
+cache_backend = 'parquet'          # 'legacy' (default) or 'parquet'
+cache_shard_size_mb = 350          # target on-disk size per cache shard
+# cache_hf_repo = 'user/my-cache'  # back up each finalized shard to this HF dataset repo
+# cache_hf_upload = true           #   (and re-download missing shards on a fresh machine)
+```
+Each cached tensor (latents, text embeddings, masks, ...) is stored in its own column with its dtype preserved (including bf16/fp8). Shards are written one at a time and are crash-safe to resume: a re-run continues from the last fully-written shard.
+
+**GPU resize (optional, off by default)** — `resize_on_gpu = true` decodes images on CPU workers and does the batched resize/crop/normalize on the GPU just before the VAE. It is not bit-identical to the CPU PIL resize, so it uses a separate cache fingerprint (existing CPU caches stay valid).
 
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.
