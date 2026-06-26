@@ -196,6 +196,28 @@ def test_fingerprint_change_clears():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_all_none_mask_column():
+    # The common parquet path (e.g. deepfashion) has mask=None for EVERY row, so a
+    # whole column (+ its __shape/__dtype side columns) is all-null. Must round-trip.
+    d = _mkdir()
+    try:
+        cache = ParquetCache(d, 'fpNone', shard_size_mb=0.01, row_group_size=4)
+        items = [_sample_item(i, with_mask=False) for i in range(10)]
+        for it in items:
+            cache.add(it)
+        cache.finalize_current_shard()
+        rd = ParquetCache(d, 'fpNone', row_group_size=4)
+        assert len(rd) == 10
+        for i in range(10):
+            got = rd[i]
+            assert got['mask'] is None, i
+            assert torch.equal(got['latents'], items[i]['latents'])
+            assert got['caption_number'] == items[i]['caption_number']
+        print('test_all_none_mask_column OK')
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_empty_finalize_noop():
     d = _mkdir()
     try:
@@ -215,6 +237,7 @@ ALL_TESTS = [
     test_crash_midbuffer_loses_only_unflushed,
     test_orphan_pruning,
     test_fingerprint_change_clears,
+    test_all_none_mask_column,
     test_empty_finalize_noop,
 ]
 
