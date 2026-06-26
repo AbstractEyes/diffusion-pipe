@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import io
 import tarfile
 import os
 import sys
@@ -21,6 +22,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE
+from utils.parquet_source import ParquetImageReader, is_parquet_spec, parse_parquet_spec
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
@@ -28,6 +30,11 @@ from comfy.sd1_clip import SD1Tokenizer
 from comfy import model_management
 # Avoids using comfy_kitchen RoPE implementations that don't have backward defined
 model_management.in_training = True
+
+
+# Number of whole source-parquet shard image-columns held in memory per decode
+# worker during latent caching. Set from the dataset config by ParquetDirectoryDataset.
+PARQUET_SHARD_LRU = 8
 
 
 def make_contiguous(*tensors):
@@ -88,6 +95,7 @@ class PreprocessMediaFile:
         if self.support_video:
             assert self.framerate
         self.tarfile_map = {}
+        self.parquet_reader = None  # lazily created on first parquet image_spec
 
     def __del__(self):
         for tar_f in self.tarfile_map.values():
@@ -96,7 +104,15 @@ class PreprocessMediaFile:
     def __call__(self, spec, mask_filepath, size_bucket=None):
         is_video = (Path(spec[1]).suffix in VIDEO_EXTENSIONS)
 
-        if spec[0] is None:
+        if is_parquet_spec(spec):
+            # Image bytes live in a parquet cell; decode in-memory (no PIL files on disk).
+            if self.parquet_reader is None:
+                self.parquet_reader = ParquetImageReader(lru=PARQUET_SHARD_LRU)
+            parquet_path, image_column, row = parse_parquet_spec(spec)
+            raw = self.parquet_reader.read_cell_bytes(parquet_path, image_column, row)
+            filepath_or_file = io.BytesIO(raw)
+            is_video = False
+        elif spec[0] is None:
             tar_f = None
             filepath_or_file = str(spec[1])
         else:

@@ -947,6 +947,107 @@ class DirectoryDataset:
             size_bucket_ds.uncond_text_embeddings.append(uncond_text_embeddings_ds)
 
 
+def _sanitize_name(s):
+    return ''.join(c if (c.isalnum() or c in '-_.') else '_' for c in str(s))
+
+
+def _default_parquet_cache_root(directory_config):
+    # Stable, writable location for the computed latent/text-embedding cache.
+    # Deliberately NOT the HF snapshot dir (which can be garbage-collected).
+    if directory_config.get('type') == 'huggingface':
+        name = '{}__{}__{}'.format(
+            directory_config['dataset'].replace('/', '__'),
+            directory_config.get('config', 'default'),
+            directory_config.get('split', 'train'),
+        )
+    else:
+        name = 'local_parquet'
+    base = os.environ.get(
+        'DIFFUSION_PIPE_PARQUET_CACHE',
+        os.path.join(os.path.expanduser('~'), '.cache', 'diffusion-pipe', 'parquet'),
+    )
+    return os.path.join(base, _sanitize_name(name))
+
+
+# DirectoryDataset variant whose images/captions come from parquet (local) or a
+# HuggingFace dataset instead of a folder of files. Aspect-ratio buckets are built
+# vectorized from width/height columns (no PIL peek); pixels are decoded lazily
+# from the parquet only during latent caching. Everything downstream (grouping,
+# SizeBucketDataset, cache backend, read path) is reused unchanged.
+class ParquetDirectoryDataset(DirectoryDataset):
+    def __init__(self, directory_config, dataset_config, model_name, framerate=None, round_to_multiple=32, skip_dataset_validation=False):
+        from utils.parquet_source import resolve_parquet_source
+        self.source = resolve_parquet_source(directory_config, num_proc=NUM_PROC)
+        # Inject a stable, writable cache root before super().__init__ (which checks
+        # that path exists and runs validate()). Users may override via `path`.
+        if not directory_config.get('path'):
+            directory_config['path'] = _default_parquet_cache_root(directory_config)
+        os.makedirs(directory_config['path'], exist_ok=True)
+        # Propagate the shard-LRU size to the (forked) decode workers via a base global.
+        import models.base as base_module
+        base_module.PARQUET_SHARD_LRU = directory_config.get(
+            'parquet_shard_lru',
+            dataset_config.get('parquet_shard_lru', base_module.PARQUET_SHARD_LRU),
+        )
+        super().__init__(
+            directory_config, dataset_config, model_name, framerate=framerate,
+            round_to_multiple=round_to_multiple, skip_dataset_validation=skip_dataset_validation,
+        )
+
+    def _get_ungrouped_metadata(self, regenerate_cache=False, trust_cache=False):
+        from utils.parquet_source import iter_parquet_rows
+        d = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
+        n_total = n_skipped_caption = n_skipped_bucket = 0
+        for row in iter_parquet_rows(self.source):
+            n_total += 1
+            captions = row['captions']
+            if captions:
+                captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
+            if not captions:
+                if self.skip_empty_caption:
+                    n_skipped_caption += 1
+                    continue
+                captions = ['']
+            w, h = row['width'], row['height']
+            if w is None or h is None or w <= 0 or h <= 0:
+                n_skipped_bucket += 1
+                continue
+            log_ar = np.log(w / h)
+            if self.use_size_buckets:
+                size_bucket = self._find_closest_size_bucket(log_ar, 1, False)
+                if size_bucket is None:
+                    n_skipped_bucket += 1
+                    continue
+                size_bucket = [int(x) for x in size_bucket]
+                ar_bucket = None
+            else:
+                ar_bucket = self._find_closest_ar_bucket(log_ar, 1, False)
+                if ar_bucket is None:
+                    n_skipped_bucket += 1
+                    continue
+                ar_bucket = [float(ar_bucket[0]), float(ar_bucket[1])]
+                size_bucket = None
+            d['image_spec'].append(list(row['image_spec']))
+            d['mask_file'].append(None)
+            d['caption'].append(captions)
+            d['ar_bucket'].append(ar_bucket)
+            d['size_bucket'].append(size_bucket)
+            d['is_video'].append(False)
+        if len(d['image_spec']) == 0:
+            raise RuntimeError(
+                f'Parquet source for {self.path} produced no usable rows '
+                f'({n_total} scanned, {n_skipped_caption} empty-caption, {n_skipped_bucket} unbucketable).'
+            )
+        if is_main_process():
+            print(f'[PARQUET] {self.path.name}: {len(d["image_spec"])} usable rows from '
+                  f'{len(self.source.shard_paths)} shard(s) '
+                  f'({n_skipped_caption} empty-caption, {n_skipped_bucket} unbucketable skipped)')
+        metadata_dataset = datasets.Dataset.from_dict(d)
+        if self.shuffle_metadata:
+            metadata_dataset = metadata_dataset.shuffle(seed=seed_from_hash(self.path))
+        return metadata_dataset
+
+
 # Outermost dataset object that the caller uses. Contains multiple ConcatenatedBatchedDataset. Responsible
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
@@ -966,7 +1067,16 @@ class Dataset:
 
         self.directory_datasets = []
         for directory_config in dataset_config['directory']:
-            directory_dataset = DirectoryDataset(
+            directory_type = directory_config.get('type', 'directory')
+            if directory_type in ('huggingface', 'parquet'):
+                directory_dataset_cls = ParquetDirectoryDataset
+            elif directory_type == 'directory':
+                directory_dataset_cls = DirectoryDataset
+            else:
+                raise ValueError(
+                    f"Unknown directory type {directory_type!r} (expected 'directory', 'huggingface', or 'parquet')"
+                )
+            directory_dataset = directory_dataset_cls(
                 directory_config,
                 dataset_config,
                 self.model_name,
