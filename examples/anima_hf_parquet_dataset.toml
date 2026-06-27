@@ -20,7 +20,8 @@ num_ar_buckets = 7
 # 'parquet'          = multi-column parquet shards (HF-uploadable, columnar).
 cache_backend = 'parquet'
 cache_shard_size_mb = 350          # target on-disk size per cache shard
-# cache_row_group_size = 64        # rows per row group in the cache (random-read granularity)
+# cache_row_group_size = 1         # rows per row group (1 = fastest random reads for big blobs)
+# cache_compression = 'none'       # latents/embeds are ~incompressible; 'none' avoids decompress on read
 
 # Optional: back up each finalized cache shard to a HuggingFace dataset repo, and
 # re-download missing shards on a fresh machine instead of recomputing them.

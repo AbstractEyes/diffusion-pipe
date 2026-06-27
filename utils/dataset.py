@@ -100,7 +100,8 @@ def make_cache(cache_dir, fingerprint, dataset_config):
             shard_size_mb=(dataset_config or {}).get('cache_shard_size_mb', 350),
             hf_repo=(dataset_config or {}).get('cache_hf_repo', None),
             hf_upload=(dataset_config or {}).get('cache_hf_upload', False),
-            row_group_size=(dataset_config or {}).get('cache_row_group_size', 64),
+            row_group_size=(dataset_config or {}).get('cache_row_group_size', 1),
+            compression=(dataset_config or {}).get('cache_compression', 'none'),
         )
     raise ValueError(f"Unknown cache_backend: {backend!r} (expected 'legacy' or 'parquet')")
 

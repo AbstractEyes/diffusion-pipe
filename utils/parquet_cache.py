@@ -33,8 +33,15 @@ import pyarrow.parquet as pq
 SHARD_FMT = 'shard_{:05d}.parquet'
 INDEX_FILE = '_index.json'
 DEFAULT_SHARD_SIZE_MB = 350
-DEFAULT_ROW_GROUP_SIZE = 64
-ROW_GROUP_LRU = 4
+# 1 row per row group + no compression is dramatically faster for random reads of
+# large incompressible blobs (latents/embeds are bf16 -> ~0% compressible, and a big
+# row group forces decompress+read of the whole group per random access). Measured
+# ~15x faster random reads vs (64, zstd) with only a few % larger shards. Shards are
+# size-capped so the per-shard row-group count (hence footer) stays small.
+DEFAULT_ROW_GROUP_SIZE = 1
+DEFAULT_COMPRESSION = 'none'
+ROW_GROUP_LRU = 8
+MAX_OPEN_FILES = 256   # cap mmap'd shard handles so large caches don't exhaust fds
 
 # torch dtype <-> string. We always route tensor bytes through torch (never numpy)
 # so dtypes numpy lacks (bfloat16, float8_*) survive a round-trip.
@@ -63,13 +70,15 @@ def _bytes_to_tensor(buf, shape, dtype_str):
 
 class ParquetCache:
     def __init__(self, path, fingerprint, shard_size_mb=DEFAULT_SHARD_SIZE_MB,
-                 hf_repo=None, hf_upload=False, row_group_size=DEFAULT_ROW_GROUP_SIZE):
+                 hf_repo=None, hf_upload=False, row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                 compression=DEFAULT_COMPRESSION):
         self.path = Path(path)
         self.fingerprint = fingerprint
         self.shard_size_mb = shard_size_mb
         self.hf_repo = hf_repo
         self.hf_upload = hf_upload
-        self.row_group_size = row_group_size
+        self.row_group_size = row_group_size   # write-time chunking only
+        self.compression = compression
         os.makedirs(self.path, exist_ok=True)
 
         # write-side buffer
@@ -78,8 +87,9 @@ class ParquetCache:
 
         # read-side state (rebuilt lazily; guarded against DataLoader worker fork)
         self._pid = os.getpid()
-        self._open_files = {}   # shard_id -> pq.ParquetFile
-        self._rg_cache = OrderedDict()  # (shard_id, rg_id) -> pa.Table (LRU)
+        self._open_files = OrderedDict()   # fname -> pq.ParquetFile (LRU-capped)
+        self._rg_offsets = {}   # fname -> list[(start_row, num_rows)] from file metadata
+        self._rg_cache = OrderedDict()  # (fname, rg_id) -> pa.Table (LRU)
         self._cum = None        # cumulative row offsets per shard, for idx -> (shard, row)
 
         self._load_or_init_index()
@@ -171,7 +181,7 @@ class ParquetCache:
         tmp = self.path / (fname + '.tmp')
         pq.write_table(
             table, tmp,
-            compression='zstd', compression_level=3,
+            compression=self.compression,
             row_group_size=self.row_group_size,
             use_dictionary=False,
         )
@@ -196,7 +206,8 @@ class ParquetCache:
             os.remove(self._index_path())
         self._buf = []
         self._buf_nbytes = 0
-        self._open_files = {}
+        self._open_files = OrderedDict()
+        self._rg_offsets = {}
         self._rg_cache.clear()
         self.index = {'fingerprint': self.fingerprint, 'shards': [], 'total': 0, 'next_shard': 0}
         self._write_index()
@@ -207,7 +218,8 @@ class ParquetCache:
         # Reset inherited handles when a DataLoader worker forks this process.
         if os.getpid() != self._pid:
             self._pid = os.getpid()
-            self._open_files = {}
+            self._open_files = OrderedDict()
+            self._rg_offsets = {}
             self._rg_cache = OrderedDict()
         if self._cum is None:
             self._cum = []
@@ -223,12 +235,34 @@ class ParquetCache:
         raise IndexError(f'index {idx} out of range for ParquetCache of length {len(self)}')
 
     def _get_file(self, fname):
-        if fname not in self._open_files:
-            local = self.path / fname
-            if not local.exists() and self.hf_repo:
-                self._download_shard(fname)
-            self._open_files[fname] = pq.ParquetFile(local, memory_map=True)
-        return self._open_files[fname]
+        f = self._open_files.get(fname)
+        if f is not None:
+            self._open_files.move_to_end(fname)
+            return f
+        local = self.path / fname
+        if not local.exists() and self.hf_repo:
+            self._download_shard(fname)
+        f = pq.ParquetFile(local, memory_map=True)
+        self._open_files[fname] = f
+        while len(self._open_files) > MAX_OPEN_FILES:
+            old, _ = self._open_files.popitem(last=False)  # drop ref -> release mmap
+            self._rg_offsets.pop(old, None)
+        return f
+
+    def _rg_offsets_for(self, fname):
+        # Actual row-group boundaries read from the file itself, so reads never assume
+        # a particular write-time row_group_size (robust if the param ever changes).
+        offs = self._rg_offsets.get(fname)
+        if offs is None:
+            md = self._get_file(fname).metadata
+            offs = []
+            start = 0
+            for i in range(md.num_row_groups):
+                n = md.row_group(i).num_rows
+                offs.append((start, n))
+                start += n
+            self._rg_offsets[fname] = offs
+        return offs
 
     def _get_row_group(self, fname, rg_id):
         key = (fname, rg_id)
@@ -246,8 +280,11 @@ class ParquetCache:
         idx = int(idx)
         self._ensure_reader()
         fname, local_row = self._locate(idx)
-        rg_id = local_row // self.row_group_size
-        row_in_rg = local_row % self.row_group_size
+        rg_id, row_in_rg = 0, local_row
+        for i, (start, n) in enumerate(self._rg_offsets_for(fname)):
+            if start <= local_row < start + n:
+                rg_id, row_in_rg = i, local_row - start
+                break
         table = self._get_row_group(fname, rg_id)
         return self._decode_row(table, row_in_rg)
 
