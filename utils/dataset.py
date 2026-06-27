@@ -106,9 +106,13 @@ def make_cache(cache_dir, fingerprint, dataset_config):
     raise ValueError(f"Unknown cache_backend: {backend!r} (expected 'legacy' or 'parquet')")
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, dataset_config=None):
-    new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
-    new_fingerprint_args.append(dataset._fingerprint)
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, dataset_config=None, identity_fingerprint=None):
+    # Copy (don't mutate the caller's list) and, when an identity_fingerprint is given,
+    # key the cache on that instead of the full dataset fingerprint. This lets the latents
+    # cache depend only on image identity (not captions/repeats) so it is reused across
+    # caption sets and bucket manifests.
+    new_fingerprint_args = [] if new_fingerprint_args is None else list(new_fingerprint_args)
+    new_fingerprint_args.append(dataset._fingerprint if identity_fingerprint is None else identity_fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
@@ -257,6 +261,18 @@ class SizeBucketDataset:
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
+    def _latents_identity_fingerprint(self):
+        # The VAE latent depends only on the image (image_spec + size_bucket + mask +
+        # optional control), never on caption or repeats. We hash the CONTENT of the
+        # remaining columns (caption / num_repeats EXCLUDED) -- NOT the datasets
+        # transformation _fingerprint, which is derived from the parent and would still
+        # vary with caption. Exclude-list so a future latent-affecting column can't be
+        # silently forgotten. -> same key across caption sets (vlm/animetimm) and across
+        # bucket-manifest repeat edits, so the latents cache is encoded once and reused.
+        drop = {'caption', 'num_repeats'}
+        cols = [c for c in self.metadata_dataset.column_names if c not in drop]
+        return Hasher.hash(self.metadata_dataset.select_columns(cols).to_dict())
+
     def cache_latents(self, map_fn, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
         # Only perturb the latents fingerprint when GPU resize is on, so existing
@@ -271,10 +287,15 @@ class SizeBucketDataset:
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
             dataset_config=self.dataset_config,
+            identity_fingerprint=self._latents_identity_fingerprint(),
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
-        iteration_order_cache_dir = self.cache_dir / 'iteration_order'
+        # iteration_order is caption/repeats dependent and cheap to rebuild; key it on the
+        # FULL metadata fingerprint (covers caption + num_repeats column + order) so vlm and
+        # animetimm coexist and editing the bucket manifest rebuilds only this (latents stay).
+        io_key = self.metadata_dataset._fingerprint
+        iteration_order_cache_dir = self.cache_dir / f'iteration_order_{io_key}'
 
         if regenerate_cache or not iteration_order_cache_dir.exists() or not trust_cache:
             print('Building iteration order')
@@ -282,6 +303,12 @@ class SizeBucketDataset:
                 tuple(image_spec): i
                 for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
             }
+
+            # Per-row repeats (from a bucket manifest) are applied HERE by emitting each
+            # entry num_repeats times, instead of replicating captions in the metadata
+            # (which would have re-fingerprinted the latents cache). A missing column -> 1x.
+            has_repeats = 'num_repeats' in self.metadata_dataset.column_names
+            sel = ['image_spec', 'caption'] + (['num_repeats'] if has_repeats else [])
 
             equal_num_captions = True
             num_captions = None
@@ -296,25 +323,29 @@ class SizeBucketDataset:
                 # If all images have the same number of captions, set things up so we read (mostly) sequentially off disk. The metadata was already shuffled in the beginning.
                 iteration_order_by_caption_num = [[] for _ in range(num_captions)]
                 seed = 0
-                for example in self.metadata_dataset.select_columns(['image_spec', 'caption']):
+                for example in self.metadata_dataset.select_columns(sel):
                     image_spec = example['image_spec']
                     captions = example['caption']
+                    rep = int(example['num_repeats']) if has_repeats else 1
                     shuffle_with_seed(captions, seed)
                     seed += 1
                     latents_idx = image_spec_to_latents_idx[tuple(image_spec)]
                     for i, caption in enumerate(captions):
-                        iteration_order_by_caption_num[i].append((image_spec, latents_idx, caption, i))
+                        entry = (image_spec, latents_idx, caption, i)
+                        iteration_order_by_caption_num[i].extend([entry] * rep)  # repeats reuse same caption_number -> same TE row
                 iteration_order_list = []
                 for l in iteration_order_by_caption_num:
                     iteration_order_list.extend(l)
             else:
                 iteration_order_list = []
-                for example in self.metadata_dataset.select_columns(['image_spec', 'caption']):
+                for example in self.metadata_dataset.select_columns(sel):
                     image_spec = example['image_spec']
                     captions = example['caption']
+                    rep = int(example['num_repeats']) if has_repeats else 1
                     latents_idx = image_spec_to_latents_idx[tuple(image_spec)]
                     for i, caption in enumerate(captions):
-                        iteration_order_list.append((image_spec, latents_idx, caption, i))
+                        entry = (image_spec, latents_idx, caption, i)
+                        iteration_order_list.extend([entry] * rep)
                 shuffle_with_seed(iteration_order_list, 42)
 
             iteration_order_dict = defaultdict(list)
@@ -1007,7 +1038,7 @@ class ParquetDirectoryDataset(DirectoryDataset):
 
     def _get_ungrouped_metadata(self, regenerate_cache=False, trust_cache=False):
         from utils.parquet_source import iter_parquet_rows
-        d = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
+        d = {'image_spec': [], 'mask_file': [], 'caption': [], 'num_repeats': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
         n_total = n_skipped_caption = n_skipped_bucket = 0
         for row in iter_parquet_rows(self.source):
             n_total += 1
@@ -1019,13 +1050,10 @@ class ParquetDirectoryDataset(DirectoryDataset):
                     n_skipped_caption += 1
                     continue
                 captions = ['']
-            # Per-row repeats from an optional bucket manifest: replicate the caption
-            # list so the row gets that many iteration-order entries (the image is still
-            # cached/encoded only once). No-op when no manifest is configured.
-            if self.bucket_manifest is not None:
-                repeats = self.bucket_manifest.repeats_for(row.get('key'))
-                if repeats > 1:
-                    captions = captions * repeats
+            # Per-row repeats from an optional bucket manifest are carried as a column and
+            # applied at iteration-order build time (NOT by replicating captions), so they
+            # don't change the latents-cache identity fingerprint. Default 1x.
+            repeats = int(self.bucket_manifest.repeats_for(row.get('key'))) if self.bucket_manifest is not None else 1
             w, h = row['width'], row['height']
             if w is None or h is None or w <= 0 or h <= 0:
                 n_skipped_bucket += 1
@@ -1048,6 +1076,7 @@ class ParquetDirectoryDataset(DirectoryDataset):
             d['image_spec'].append(list(row['image_spec']))
             d['mask_file'].append(None)
             d['caption'].append(captions)
+            d['num_repeats'].append(repeats)
             d['ar_bucket'].append(ar_bucket)
             d['size_bucket'].append(size_bucket)
             d['is_video'].append(False)

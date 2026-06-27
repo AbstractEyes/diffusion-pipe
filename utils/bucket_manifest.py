@@ -9,10 +9,11 @@ A manifest maps a stable per-row key (e.g. the dataset's `id` column) to:
   - num_repeats: how many times that row participates per epoch (default 1), and
   - bucket (optional): a logical label, recorded for downstream/analysis use.
 
-The parquet input source applies num_repeats by replicating a row's caption list,
-which adds that many iteration-order entries pointing at the single cached latent
-(the image is still VAE-encoded only once). When no manifest is configured the
-behavior is identical to plain per-directory num_repeats.
+The parquet input source carries num_repeats as a metadata column and emits that
+many iteration-order entries per row, all pointing at the single cached latent (the
+image is VAE-encoded once, and the latents cache is caption/repeats-independent so
+it is reused across caption sets and manifest edits). When no manifest is configured
+the behavior is identical to plain per-directory num_repeats.
 
 Dependency-light (stdlib + optional pyarrow) so it stays importable without torch.
 """
