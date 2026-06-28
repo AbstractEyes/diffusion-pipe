@@ -1,0 +1,42 @@
+# Dataset config for training on the synthetic Qwen-Image character set produced by
+# qwen_extraction/qwen_lightning_extraction.py and pushed to AbstractPhil/qwen-synth-characters.
+#
+# The extraction writes an `image` HF Image feature (struct<bytes, path>) plus int
+# image_width/image_height, the augmented `prompt`, an `id` key, and race/age metadata
+# columns. That schema is exactly what the parquet input source ingests, so this trains
+# with zero adapter code. Set `dataset = '.../qwen_synth_characters_dataset.toml'` in your
+# training config (model type 'qwen_image', 'anima', 'sdxl', ... — the path is model-agnostic).
+
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+
+# Multi-column parquet cache (HF-uploadable). See examples/anima_hf_parquet_dataset.toml.
+cache_backend = 'parquet'
+cache_shard_size_mb = 350
+resize_on_gpu = true
+parquet_shard_lru = 8
+# cache_hf_repo = 'AbstractPhil/qwen-synth-characters-cache'
+# cache_hf_upload = true
+
+[[directory]]
+type = 'huggingface'
+dataset = 'AbstractPhil/qwen-synth-characters'
+split = 'train'
+image_column = 'image'
+width_column = 'image_width'
+height_column = 'image_height'
+caption_column = 'prompt'          # the augmented (race/age-constrained) prompt used to generate
+caption_type = 'text'
+num_repeats = 1
+skip_empty_caption = true
+manifest_key_column = 'id'
+
+# Later (re-imposition): generate a race-balanced repeat manifest from the emitted `race`
+# metadata via utils/subject_bucket.dampened_repeats, then add:
+# bucket_manifest = 'race_manifest.json'
+#
+# Note: run the separate strong age-verification filter over this dataset BEFORE using it as a
+# diffusion-pretrain input (the extraction only prompt-constrains age to 25-35 + records metadata).
