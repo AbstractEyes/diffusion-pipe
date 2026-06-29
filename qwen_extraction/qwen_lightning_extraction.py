@@ -63,6 +63,11 @@ def build_arrow_schema():
         "gender": Value("string"),
         "age_band": Value("string"),
         "hair": Value("string"),
+        "eye": Value("string"),
+        "expression": Value("string"),
+        "makeup": Value("string"),
+        "jewelry": Value("string"),
+        "is_amateur": Value("bool"),
         "seed": Value("int64"),
         "width_ratio": Value("string"),
         "policy_version": Value("string"),
@@ -98,6 +103,21 @@ def load_prompts(dataset: str, column: str, limit: int = 0):
             gidx += 1
             if limit and len(out) >= limit:
                 return out
+    return out
+
+
+def load_prompts_file(path: str, limit: int = 0):
+    """Return list[(id, caption)] from a 'id<TAB>caption' TSV (synthetic-caption batches)."""
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            rid, _, cap = line.partition("\t")
+            out.append((rid, cap))
+            if limit and len(out) >= limit:
+                break
     return out
 
 
@@ -293,6 +313,8 @@ def main():
     ap.add_argument("--local-dir", default="/workspace/qwen_synth_out")
     ap.add_argument("--source-dataset", default=SOURCE_DATASET)
     ap.add_argument("--source-column", default="prompt")
+    ap.add_argument("--prompts-file", default="",
+                    help="TSV of 'id<TAB>caption' lines; overrides the HF source (synthetic batches)")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--seed-base", type=int, default=1234)
@@ -307,12 +329,20 @@ def main():
                          "(fits 48GB but ~10x slower); auto=resident then offload on OOM")
     ap.add_argument("--no-upload", action="store_true")
     ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--no-dedup", action="store_true",
+                    help="disable the sentence-similarity anti-flooding resampler")
+    ap.add_argument("--dedup-threshold", type=float, default=0.82,
+                    help="token-shingle Jaccard above which a prompt counts as a near-duplicate")
     ap.add_argument("--dry-run", action="store_true", help="augment + write a tiny solid image, no GPU")
     args = ap.parse_args()
 
     cfg = prompt_policy.PromptAugmentConfig()
-    print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.source_dataset}", flush=True)
-    prompts = load_prompts(args.source_dataset, args.source_column, args.limit)
+    if args.prompts_file:
+        print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.prompts_file}", flush=True)
+        prompts = load_prompts_file(args.prompts_file, args.limit)
+    else:
+        print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.source_dataset}", flush=True)
+        prompts = load_prompts(args.source_dataset, args.source_column, args.limit)
     mine = prompts[args.rank::args.world_size]
     print(f"[rank{args.rank}] {len(prompts)} total, {len(mine)} for this rank", flush=True)
 
@@ -330,8 +360,12 @@ def main():
                                      negative=args.negative_prompt, offload=args.offload,
                                      max_seq_len=args.max_seq_len)
 
+    # Anti-flooding: per-rank sentence-similarity guard (resamples attributes on near-duplicates).
+    guard = None if args.no_dedup else prompt_policy.DiversityGuard(threshold=args.dedup_threshold)
+
     t0 = time.time()
     done = 0
+    resampled = 0
     batch_idx = 0
     for start in range(0, len(mine), args.batch_size):
         batch = mine[start:start + args.batch_size]
@@ -340,7 +374,8 @@ def main():
         width, height = RATIOS[rrng.randrange(len(RATIOS))]
         batch_idx += 1
 
-        metas = [prompt_policy.augment(p, rid, cfg) for (rid, p) in batch]
+        metas = [prompt_policy.augment_diverse(p, rid, cfg, guard=guard) for (rid, p) in batch]
+        resampled += sum(m.get("dedup_resamples", 0) > 0 for m in metas)
         # skip empties / non-person prompts that produced no text
         rows = [(rid, m) for (rid, _), m in zip(batch, metas) if m["final_prompt"]]
         if not rows:
@@ -364,6 +399,11 @@ def main():
                 "gender": m["gender"] or "",
                 "age_band": m["age_band"] or "",
                 "hair": m["hair"] or "",
+                "eye": m.get("eye") or "",
+                "expression": m.get("expression") or "",
+                "makeup": m.get("makeup") or "",
+                "jewelry": m.get("jewelry") or "",
+                "is_amateur": bool(m.get("is_amateur")),
                 "seed": int(m["seed"]),
                 "width_ratio": f"{width}x{height}",
                 "policy_version": m["policy_version"],
@@ -376,7 +416,8 @@ def main():
 
     writer.finalize_current_shard()
     dt = time.time() - t0
-    print(f"[rank{args.rank}] DONE {done} images in {dt:.0f}s ({done/max(1e-6,dt):.2f} img/s)", flush=True)
+    print(f"[rank{args.rank}] DONE {done} images in {dt:.0f}s ({done/max(1e-6,dt):.2f} img/s); "
+          f"dedup-resampled {resampled}", flush=True)
 
 
 def _generate_with_backoff(gen, prompts, width, height, seeds, args):

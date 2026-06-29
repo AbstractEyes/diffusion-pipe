@@ -54,7 +54,33 @@ Each rank owns `data/rank{R}/` in the repo so the 4 ranks never collide. PNG (lo
 ## After generation
 1. Confirm the Hub dataset viewer renders thumbnails (image is an HF Image feature).
 2. Train with `examples/qwen_synth_characters_dataset.toml`.
-3. Run the **separate strong age-verification filter** before using as a diffusion-pretrain input
-   (this script only prompt-constrains age 25-35 + records `age_band` metadata).
+3. Run the **separate strong age-verification filter + child-tag snip** before using as a
+   diffusion-pretrain input (this script only prompt-constrains age 25-35 + de-minors + records
+   `age_band` metadata; it does not filter — that is a deliberate later step).
 4. Optional re-imposition: build a race-balanced repeat manifest from the emitted `race` column
    via `utils/subject_bucket.dampened_repeats`, then set `bucket_manifest=` in the dataset TOML.
+
+## Actual run config used (RTX PRO 6000 Blackwell, 96GB x2)
+2 GPUs, `--offload off` (resident, ~1.7 s/img/GPU @ batch 16). Qwen-Image is ~20B/~56GB — fits
+resident on 96GB; needs torch w/ sm_120 (cap (12,0)). Deploy code via base64-over-ssh (scp was
+flaky): `B64=$(base64 -w0 <f); ssh "echo $B64|base64 -d>dest"`. HF_TOKEN read from /proc/1/environ.
+
+## Synthetic expansion (grow the set beyond the 40,848 FFHQ prompts)
+`synth_captions.py` makes diverse combinatorial character captions; `--prompts-file` feeds them in;
+the same augment layer adds demographics/expression/attributes. The pod-side orchestrator
+`synth_loop.sh` waits for the FFHQ run to finish, then loops 10k-image batches forever (ids
+`synth_b{N}_*`, appended to the same repo/local-dir), until `touch /workspace/STOP_SYNTH` or pod death.
+```bash
+# one synthetic batch by hand:
+python3 qwen_extraction/synth_captions.py --count 10000 --batch 0 --out /workspace/caps0.tsv
+for R in 0 1; do CUDA_VISIBLE_DEVICES=$R setsid python3 -m qwen_extraction.qwen_lightning_extraction \
+  --rank $R --world-size 2 --prompts-file /workspace/caps0.tsv --offload off --batch-size 16 \
+  --out-repo AbstractPhil/qwen-synth-characters --local-dir /workspace/qwen_synth_out \
+  > /workspace/cap0_r$R.log 2>&1 </dev/null & done
+# or the autonomous loop: SYNTH_COUNT=10000 setsid bash qwen_extraction/synth_loop.sh &
+```
+
+## Anti-flooding & policy knobs
+`--no-dedup` disables the MinHash/LSH sentence-similarity resampler; `--dedup-threshold` tunes it.
+Expression/hair/eye/makeup/jewelry/quality weights + the race distribution live in
+`prompt_policy.py` (PromptAugmentConfig + the module-level taxonomies); `POLICY_VERSION` stamps each row.
