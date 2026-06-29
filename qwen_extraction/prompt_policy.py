@@ -192,6 +192,8 @@ class PromptAugmentConfig:
     inject_eye: bool = True
     inject_makeup: bool = True
     inject_jewelry: bool = True
+    domain: str = "face"                 # 'face' (portrait policy) | 'fashion' (full-body outfit policy)
+    studio_fraction: float = 0.18       # fashion: fraction of backgrounds kept as clean studio
     seed_salt: str = "qwen-synth-v2"
 
 
@@ -399,6 +401,8 @@ def is_person_prompt(text):
 # ======================================================================================
 def augment(source_prompt: str, row_id, cfg: PromptAugmentConfig = None) -> dict:
     cfg = cfg or PromptAugmentConfig()
+    if cfg.domain == "fashion":
+        return augment_fashion(source_prompt, row_id, cfg)
     text = (source_prompt or "").strip()
     seed = stable_seed(row_id, cfg.seed_salt)
     rng = random.Random(seed)
@@ -489,6 +493,96 @@ def augment(source_prompt: str, row_id, cfg: PromptAugmentConfig = None) -> dict
 def _sentence_case(text):
     text = text.strip()
     return text[:1].upper() + text[1:] if text else text
+
+
+# ======================================================================================
+# FASHION domain: full-body outfit photos (DeepFashion expansion) -- the policy owns all
+# composition so real DeepFashion + synthetic outfit captions get identical treatment.
+# ======================================================================================
+_FVOCAB = None
+_WHITEBG_RE = None
+
+
+def _fashion_vocab():
+    global _FVOCAB
+    if _FVOCAB is None:
+        try:
+            from qwen_extraction import fashion_vocab as V
+        except ImportError:
+            import fashion_vocab as V
+        _FVOCAB = V
+    return _FVOCAB
+
+
+def strip_whitebg(text: str) -> str:
+    """Remove the DeepFashion plain/white-background phrasings."""
+    global _WHITEBG_RE
+    if _WHITEBG_RE is None:
+        pats = sorted(_fashion_vocab().WHITEBG_STRIP, key=len, reverse=True)
+        _WHITEBG_RE = re.compile("|".join(re.escape(p).replace(r"\ ", r"\s+") for p in pats), re.I)
+    return _tidy(_WHITEBG_RE.sub("", text))
+
+
+def augment_fashion(source_prompt: str, row_id, cfg: PromptAugmentConfig) -> dict:
+    """Full-body fashion treatment: keep the (gender-appropriate) outfit, diversify the wearer's
+    race, and add background / pose / framing / angle / view / lighting / full-length color quality
+    so the entire outfit is visible. Used for DeepFashion-real and synthetic outfit captions alike."""
+    V = _fashion_vocab()
+    text = (source_prompt or "").strip()
+    seed = stable_seed(row_id, cfg.seed_salt)
+    rng = random.Random(seed)
+    meta = {
+        "id": str(row_id), "seed": seed, "source_prompt": source_prompt, "final_prompt": text,
+        "race": None, "race_injected": False, "is_tail": False, "gender": None,
+        "hair": None, "hair_injected": False, "eye": None, "eye_injected": False,
+        "expression": None, "makeup": None, "jewelry": None, "is_amateur": False,
+        "age_band": None, "age_overridden": False, "age_terms_removed": [],
+        "is_face_prompt": True, "policy_version": "fashion-v1",
+    }
+    if not text or not is_person_prompt(text):
+        return meta
+
+    gender, _minor = detect_gender(text)
+    meta["gender"] = gender
+    race_label, _ = detect_race(text, cfg)
+    race_explicit = race_label is not None
+    label, is_tail = (race_label, False) if race_explicit else sample_race(rng, cfg)
+    meta["race"], meta["race_injected"], meta["is_tail"] = label, not race_explicit, is_tail
+
+    base = strip_whitebg(text)
+    base = re.sub(r"(\w)\s+-\s+(\w)", r"\1-\2", base)      # fix DeepFashion "t - shirt" -> "t-shirt"
+    base, removed = strip_age_terms(base)
+    base = deminor(base)
+    meta["age_band"], meta["age_overridden"], meta["age_terms_removed"] = cfg.age_band, len(removed) > 0, removed
+    if not race_explicit:
+        base, _ok = _inject_race_into_subject(base, _race_descriptor(label, gender))
+
+    clauses = []
+    # background: mostly varied real settings, ~studio_fraction kept as clean studio
+    clauses.append(rng.choice(V.STUDIO_BACKGROUNDS if rng.random() < cfg.studio_fraction else V.REAL_SETTINGS))
+    if cfg.inject_hair and rng.random() < 0.7:
+        pal = HAIR_DARK if label in DARK_FEATURE_RACES else HAIR_FULL
+        hair = sample_weighted(rng, pal)
+        meta["hair"], meta["hair_injected"] = hair, True
+        clauses.append(f"with {hair}")
+    if rng.random() < 0.75:
+        clauses.append(rng.choice(V.POSES))
+    if rng.random() < 0.55:
+        clauses.append(rng.choice(V.SUBJECT_VIEWS))
+    clauses.append(rng.choice(V.FRAMING_CROPS))            # always -> ensures the whole outfit shows
+    if rng.random() < 0.5:
+        clauses.append(rng.choice(V.CAMERA_ANGLES))
+    clauses.append(_age_phrase(gender))
+    if rng.random() < 0.6:
+        clauses.append(rng.choice(V.LIGHTING))
+
+    is_amateur = rng.random() < cfg.amateur_fraction
+    quality = rng.choice(V.FASHION_AMATEUR if is_amateur else V.FASHION_QUALITY)
+    meta["is_amateur"] = is_amateur
+
+    final = base.rstrip(" .,") + ", " + ", ".join(clauses) + ". " + quality + "."
+    meta["final_prompt"] = _sentence_case(_tidy(final)).rstrip(".") + "."
+    return meta
 
 
 # ======================================================================================

@@ -78,18 +78,35 @@ def build_arrow_schema():
 # --------------------------------------------------------------------------------------
 # Source prompt loader (columnar; never touches the big `latent` column)
 # --------------------------------------------------------------------------------------
-def load_prompts(dataset: str, column: str, limit: int = 0):
-    """Return list[(id:str, prompt:str)]. Reads ONLY the `column` from the source parquet via
-    HTTP range reads (HfFileSystem), so the large `latent` column is never downloaded. `id` is the
-    stable global row index across shards in sorted-file / row order."""
+def load_prompts(dataset: str, column: str, limit: int = 0, config: str = "", json_path: str = ""):
+    """Return list[(id:str, prompt:str)]. Reads ONLY `column` from the source parquet via HTTP range
+    reads (HfFileSystem), so big columns (latents/images) are never downloaded.
+    - config: restrict to the dataset config subdir, e.g. 'deepfashion' -> data/deepfashion/*.parquet.
+    - json_path: if set, each cell is a JSON object/string and this key is extracted (e.g.
+      column='captions_source_json', json_path='deepfashion_caption').
+    `id` is the stable global row index (prefixed by config) across shards in sorted-file order."""
+    import json as _json
     import pyarrow.parquet as pq
     from huggingface_hub import HfApi, HfFileSystem
 
     api = HfApi()
     rels = sorted(f for f in api.list_repo_files(dataset, repo_type="dataset") if f.endswith(".parquet"))
+    if config:
+        rels = [f for f in rels if config in f.replace("\\", "/").split("/")]
     if not rels:
-        raise RuntimeError(f"No parquet files found in {dataset}")
+        raise RuntimeError(f"No parquet files found in {dataset} (config={config!r})")
+
+    def extract(v):
+        if json_path:
+            if v is None:
+                return ""
+            d = v if isinstance(v, dict) else _json.loads(v)
+            val = d.get(json_path) if isinstance(d, dict) else None
+            return val if isinstance(val, str) else ("" if val is None else str(val))
+        return v if isinstance(v, str) else ("" if v is None else str(v))
+
     fs = HfFileSystem()
+    prefix = f"{config}_" if config else ""
     out = []
     gidx = 0
     for rel in rels:
@@ -99,7 +116,8 @@ def load_prompts(dataset: str, column: str, limit: int = 0):
                 raise RuntimeError(f"Column {column!r} not in {rel}; have {pf.schema_arrow.names}")
             tbl = pf.read(columns=[column])
         for v in tbl.column(column).to_pylist():
-            out.append((str(gidx), v if isinstance(v, str) else ("" if v is None else str(v))))
+            cap = extract(v)
+            out.append((f"{prefix}{gidx}", cap))
             gidx += 1
             if limit and len(out) >= limit:
                 return out
@@ -313,6 +331,10 @@ def main():
     ap.add_argument("--local-dir", default="/workspace/qwen_synth_out")
     ap.add_argument("--source-dataset", default=SOURCE_DATASET)
     ap.add_argument("--source-column", default="prompt")
+    ap.add_argument("--source-config", default="", help="restrict to a dataset config subdir, e.g. 'deepfashion'")
+    ap.add_argument("--source-json-path", default="", help="extract this key from a JSON column, e.g. 'deepfashion_caption'")
+    ap.add_argument("--domain", default="face", choices=["face", "fashion"],
+                    help="augmentation policy: face (portraits) or fashion (full-body outfits)")
     ap.add_argument("--prompts-file", default="",
                     help="TSV of 'id<TAB>caption' lines; overrides the HF source (synthetic batches)")
     ap.add_argument("--batch-size", type=int, default=8)
@@ -336,13 +358,15 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="augment + write a tiny solid image, no GPU")
     args = ap.parse_args()
 
-    cfg = prompt_policy.PromptAugmentConfig()
+    cfg = prompt_policy.PromptAugmentConfig(domain=args.domain)
     if args.prompts_file:
-        print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.prompts_file}", flush=True)
+        print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.prompts_file} (domain={args.domain})", flush=True)
         prompts = load_prompts_file(args.prompts_file, args.limit)
     else:
-        print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.source_dataset}", flush=True)
-        prompts = load_prompts(args.source_dataset, args.source_column, args.limit)
+        print(f"[rank{args.rank}/{args.world_size}] loading prompts from {args.source_dataset} "
+              f"config={args.source_config!r} (domain={args.domain})", flush=True)
+        prompts = load_prompts(args.source_dataset, args.source_column, args.limit,
+                               config=args.source_config, json_path=args.source_json_path)
     mine = prompts[args.rank::args.world_size]
     print(f"[rank{args.rank}] {len(prompts)} total, {len(mine)} for this rank", flush=True)
 
