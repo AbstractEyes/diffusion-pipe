@@ -23,6 +23,14 @@ configs:
   data_files:
   - split: train
     path: data/**/*.parquet
+- config_name: rank0
+  data_files:
+  - split: train
+    path: dataset_viewer/rank0.parquet
+- config_name: rank1
+  data_files:
+  - split: train
+    path: dataset_viewer/rank1.parquet
 dataset_info:
   features:
   - name: id
@@ -64,6 +72,12 @@ dataset_info:
   - name: width_ratio
     dtype: string
   - name: policy_version
+    dtype: string
+  - name: caption_joycaption
+    dtype: string
+  - name: caption_qwen35_4b
+    dtype: string
+  - name: caption_animetimm
     dtype: string
   splits:
   - name: train
@@ -108,6 +122,16 @@ full-body fashion generation, complementing the portrait-oriented sister set
 
 The `image` column is a standard 🤗 `datasets` **Image** feature (PNG), so the Hub viewer renders
 thumbnails and `load_dataset` decodes it directly.
+
+Every row also carries **three image-grounded captions of the generated image** — `caption_joycaption`
+(detailed natural language, JoyCaption), `caption_qwen35_4b` (natural language, Qwen3.5-4B), and
+`caption_animetimm` (booru-style tags, anime/wd-tagger) — alongside the `prompt` used to generate it
+and the original `source_prompt`. Unlike `prompt`/`source_prompt` (generation *intent*), these three
+describe the **rendered** image, and are populated on all rows (real and synthetic).
+
+A lightweight, instantly-viewable 100-row preview of each rank lives under `dataset_viewer/` and is
+exposed as the `rank0` / `rank1` viewer configs (the full 160k `default` config renders in the
+paginated viewer but has no inline first-rows preview because of its size).
 
 ## How it was generated
 
@@ -154,6 +178,9 @@ thumbnails and `load_dataset` decodes it directly.
 | `seed` | int64 | deterministic per-`id` seed |
 | `width_ratio` | string | e.g. `832x1216` |
 | `policy_version` | string | augmentation policy version (`fashion-v1`) |
+| `caption_joycaption` | string | image-grounded caption of the **generated** image (JoyCaption, detailed natural language) |
+| `caption_qwen35_4b` | string | image-grounded caption of the **generated** image (Qwen3.5-4B, natural language) |
+| `caption_animetimm` | string | image-grounded booru-style tags of the **generated** image (anime / wd-tagger) |
 
 > Background (studio vs. real) and garment category are **embedded in the prompt text**, not stored
 > as columns; they can be recovered with the dataset's own vocab (`qwen_extraction/fashion_vocab.py`),
