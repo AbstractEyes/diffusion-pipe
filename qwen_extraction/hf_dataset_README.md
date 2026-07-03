@@ -22,6 +22,14 @@ configs:
   data_files:
   - split: train
     path: data/**/*.parquet
+- config_name: rank0
+  data_files:
+  - split: train
+    path: dataset_viewer/rank0.parquet
+- config_name: rank1
+  data_files:
+  - split: train
+    path: dataset_viewer/rank1.parquet
 dataset_info:
   features:
   - name: id
@@ -64,6 +72,12 @@ dataset_info:
     dtype: string
   - name: policy_version
     dtype: string
+  - name: caption_joycaption
+    dtype: string
+  - name: caption_qwen35_4b
+    dtype: string
+  - name: caption_animetimm
+    dtype: string
   splits:
   - name: train
     num_examples: 60847
@@ -96,6 +110,16 @@ to counter the base model's tendency to default to a narrow set of faces.
 
 The `image` column is a standard 🤗 `datasets` **Image** feature (PNG), so the Hub viewer renders
 thumbnails and `load_dataset` decodes it directly.
+
+Every row also carries **three image-grounded captions of the generated portrait** — `caption_joycaption`
+(detailed natural language, JoyCaption), `caption_qwen35_4b` (natural language, Qwen3.5-4B), and
+`caption_animetimm` (booru-style tags, anime/wd-tagger) — alongside the `prompt` used to generate it
+and the original `source_prompt`. Unlike `prompt`/`source_prompt` (generation *intent*), these three
+describe the **rendered** image.
+
+A lightweight, instantly-viewable 100-row preview of each rank lives under `dataset_viewer/` and is
+exposed as the `rank0` / `rank1` viewer configs (the full `default` config renders in the paginated
+viewer but has no inline first-rows preview because of its size).
 
 ## How it was generated
 
@@ -141,6 +165,9 @@ thumbnails and `load_dataset` decodes it directly.
 | `seed` | int64 | deterministic per-`id` seed |
 | `width_ratio` | string | e.g. `1024x1024` |
 | `policy_version` | string | augmentation policy version (`augment-v2`) |
+| `caption_joycaption` | string | image-grounded caption of the **generated** portrait (JoyCaption, detailed natural language) |
+| `caption_qwen35_4b` | string | image-grounded caption of the **generated** portrait (Qwen3.5-4B, natural language) |
+| `caption_animetimm` | string | image-grounded booru-style tags of the **generated** portrait (anime / wd-tagger) |
 
 ## Composition (actual, measured over all 60,847 rows)
 
