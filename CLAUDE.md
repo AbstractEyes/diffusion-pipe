@@ -131,6 +131,25 @@ The flag is `--regenerate_cache` (underscore).
 - keep `map_num_proc` modest (4–12 for ~1.8GB shards), set `parquet_shard_lru >= num_shards`
 - `resize_on_gpu = true` makes CPU workers decode-only
 
+### Multi-GPU (data-parallel) latents caching — `cache_multigpu.py`
+
+The built-in `train.py --cache_only` is single-producer (~1 GPU). To cache a big dataset across
+**all** GPUs, use the opt-in tool (normal single-GPU path unchanged):
+
+```bash
+python cache_multigpu.py --config train.toml --num_gpus 4      # shard+merge latents across GPUs
+deepspeed --num_gpus=4 train.py --deepspeed --config train.toml --trust_cache   # then train (adopt merge)
+```
+
+It shards latents caching into **one-shard-per-job** waves (avoids the `parquet_shard_lru < num_shards`
+decode-pool deadlock), merges per-bucket latents into the config's cache root, and relies on the
+**image_spec-keyed read** (order-independent, so a bad merge only re-caches, never misaligns). The
+`--trust_cache` flag is required so the trainer adopts the merged cache's placeholder fingerprint.
+
+**Gotcha (`before/after` 2-phase):** `skip_empty_caption` makes each caption column's survivor set
+different, so a cache built for one column crashes a phase reading another. **Cache each phase into
+its own cache root.** Full design, deadlock diagnosis, and troubleshooting: [docs/multigpu_caching.md](docs/multigpu_caching.md).
+
 ## Key utils
 
 - `utils/dataset.py` — dataset loading + caching orchestration (`make_cache` factory,
@@ -156,6 +175,7 @@ python test/test_image_resize.py
 python test/test_bucket_manifest.py
 python test/test_subject_bucket.py
 python test/test_latents_decouple.py
+python test/test_cache_multigpu.py   # multi-GPU cache driver (needs `toml`; no torch/GPU)
 ```
 
 ## Conventions

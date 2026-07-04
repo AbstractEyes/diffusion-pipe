@@ -71,7 +71,7 @@ def _bytes_to_tensor(buf, shape, dtype_str):
 class ParquetCache:
     def __init__(self, path, fingerprint, shard_size_mb=DEFAULT_SHARD_SIZE_MB,
                  hf_repo=None, hf_upload=False, row_group_size=DEFAULT_ROW_GROUP_SIZE,
-                 compression=DEFAULT_COMPRESSION):
+                 compression=DEFAULT_COMPRESSION, trust_cache=False):
         self.path = Path(path)
         self.fingerprint = fingerprint
         self.shard_size_mb = shard_size_mb
@@ -79,6 +79,11 @@ class ParquetCache:
         self.hf_upload = hf_upload
         self.row_group_size = row_group_size   # write-time chunking only
         self.compression = compression
+        # trust_cache: adopt an existing index even if its fingerprint doesn't match
+        # (used when reading a cache assembled out-of-band, e.g. merged from per-rank
+        # shards built by the 4-GPU data-parallel cache path). The read is image_spec-
+        # keyed (see utils.dataset), so an unmatched fingerprint doesn't affect correctness.
+        self.trust_cache = trust_cache
         os.makedirs(self.path, exist_ok=True)
 
         # write-side buffer
@@ -103,6 +108,13 @@ class ParquetCache:
             with open(self._index_path()) as f:
                 self.index = json.load(f)
             if self.index.get('fingerprint') != self.fingerprint:
+                if self.trust_cache:
+                    print('[PARQUET-CACHE] Fingerprint mismatch but trust_cache set; '
+                          'adopting existing index as-is (image_spec-keyed read)')
+                    self._prune_orphans()
+                    self._cum = None
+                    print(f'[PARQUET-CACHE] {self.path.name}: existing length {len(self)}')
+                    return
                 print('[PARQUET-CACHE] Fingerprint changed, clearing existing cache')
                 self.clear()
                 return
@@ -314,6 +326,30 @@ class ParquetCache:
             else:
                 # native scalar column (caption str, caption_number int, ...)
                 out[name] = table.column(name)[r].as_py()
+        return out
+
+    def image_specs(self):
+        '''Return the list of image_spec tuples for every cached row, in cache order.
+
+        Columnar read of the 'image_spec__json' column across all shards (no tensor
+        decode), so building an image_spec -> latents_idx map is cheap even for 100k+
+        rows. Used by the image_spec-keyed latent read so the latent cache can be in
+        any order (e.g. assembled by merging per-rank 4-GPU cache shards).'''
+        self._ensure_reader()
+        out = []
+        for s in self.index['shards']:
+            pf = self._get_file(s['file'])
+            col = 'image_spec__json' if 'image_spec__json' in pf.schema_arrow.names else (
+                'image_spec' if 'image_spec' in pf.schema_arrow.names else None)
+            if col is None:
+                raise KeyError(f'ParquetCache shard {s["file"]} has no image_spec column')
+            for v in pf.read(columns=[col]).column(col).to_pylist():
+                if v is None:
+                    out.append(None)
+                elif isinstance(v, str):
+                    out.append(tuple(json.loads(v)))
+                else:
+                    out.append(tuple(v))
         return out
 
     # ------------------------------------------------------------- HF backup --

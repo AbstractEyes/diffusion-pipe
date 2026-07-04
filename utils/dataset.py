@@ -82,7 +82,7 @@ def seed_from_hash(item):
     return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
 
 
-def make_cache(cache_dir, fingerprint, dataset_config):
+def make_cache(cache_dir, fingerprint, dataset_config, trust_cache=False):
     '''Factory selecting the cache backend from the dataset config.
 
     'legacy' (default) -> utils.cache.Cache (sqlite + torch.save binary shards).
@@ -102,11 +102,12 @@ def make_cache(cache_dir, fingerprint, dataset_config):
             hf_upload=(dataset_config or {}).get('cache_hf_upload', False),
             row_group_size=(dataset_config or {}).get('cache_row_group_size', 1),
             compression=(dataset_config or {}).get('cache_compression', 'none'),
+            trust_cache=trust_cache,
         )
     raise ValueError(f"Unknown cache_backend: {backend!r} (expected 'legacy' or 'parquet')")
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, dataset_config=None, identity_fingerprint=None):
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, dataset_config=None, identity_fingerprint=None, trust_cache=False):
     # Copy (don't mutate the caller's list) and, when an identity_fingerprint is given,
     # key the cache on that instead of the full dataset fingerprint. This lets the latents
     # cache depend only on image identity (not captions/repeats) so it is reused across
@@ -117,7 +118,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
-    cache = make_cache(cache_dir, new_fingerprint, dataset_config)
+    cache = make_cache(cache_dir, new_fingerprint, dataset_config, trust_cache=trust_cache)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -288,6 +289,7 @@ class SizeBucketDataset:
             caching_batch_size=caching_batch_size,
             dataset_config=self.dataset_config,
             identity_fingerprint=self._latents_identity_fingerprint(),
+            trust_cache=trust_cache,
         )
         assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
@@ -299,10 +301,23 @@ class SizeBucketDataset:
 
         if regenerate_cache or not iteration_order_cache_dir.exists() or not trust_cache:
             print('Building iteration order')
-            image_spec_to_latents_idx = {
-                tuple(image_spec): i
-                for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
-            }
+            # image_spec-keyed latents index: read the image_spec of each cached row from
+            # the latent cache itself, so latents_idx points to wherever each image's latent
+            # actually lives. This makes the latent cache ORDER-INDEPENDENT -- required for
+            # the 4-GPU data-parallel cache path, which merges per-rank shards in an order
+            # that need not match metadata_dataset. Falls back to metadata order for cache
+            # backends that don't expose image_specs() (legacy sqlite cache).
+            if hasattr(self.latent_dataset, 'image_specs'):
+                cached_specs = self.latent_dataset.image_specs()
+                image_spec_to_latents_idx = {tuple(spec): i for i, spec in enumerate(cached_specs)}
+                assert len(image_spec_to_latents_idx) == len(self.latent_dataset), (
+                    'latent cache has duplicate or missing image_spec',
+                    len(image_spec_to_latents_idx), len(self.latent_dataset))
+            else:
+                image_spec_to_latents_idx = {
+                    tuple(image_spec): i
+                    for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
+                }
 
             # Per-row repeats (from a bucket manifest) are applied HERE by emitting each
             # entry num_repeats times, instead of replicating captions in the metadata
