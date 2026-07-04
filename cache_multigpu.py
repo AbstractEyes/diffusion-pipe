@@ -305,7 +305,11 @@ def merge_caches(job_cache_dirs, target_cache_root, fingerprint='merged_multigpu
                 if not os.path.isfile(sf):
                     continue
                 newname = f'shard_{n:05d}.parquet'
-                shutil.copyfile(sf, os.path.join(dst, newname))
+                # MOVE, not copy: the per-job caches (work_dir) and the target cache_root are on the
+                # same filesystem, so this is a rename (instant, no extra bytes). Copying would
+                # briefly hold BOTH the per-job caches and the merged cache on disk (~2x peak usage,
+                # which can overflow the volume on big datasets). The emptied work_dir is removed after.
+                shutil.move(sf, os.path.join(dst, newname))
                 shards.append({'file': newname, 'rows': s['rows'], 'uploaded': False})
                 n += 1
         rows = sum(s['rows'] for s in shards)

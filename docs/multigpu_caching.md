@@ -62,7 +62,12 @@ Given your normal training TOML, the tool:
    one shard and a private cache dir. GPU pinning uses `deepspeed --include localhost:<gpu>` with a
    distinct `MASTER_PORT` per GPU.
 3. **Merges** every job's per-size-bucket `latents/` shards into your real cache root and writes a
-   fresh `_index.json` per bucket (placeholder fingerprint `merged_multigpu`).
+   fresh `_index.json` per bucket (placeholder fingerprint `merged_multigpu`), then deletes the
+   scratch `work_dir`.
+
+**Disk usage:** the merge *moves* (renames, same filesystem) rather than copies, and the scratch
+dir is deleted afterward, so peak disk is ~1× the final cache size, not 2×. Budget roughly the size
+of the latents cache you're building (plus your source shards, which the jobs read in place).
 
 Your subsequent `train.py --trust_cache` run then adopts that merged cache and only has to build
 text-embeddings (fast) before training.
