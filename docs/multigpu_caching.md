@@ -67,7 +67,9 @@ Given your normal training TOML, the tool:
 
 **Disk usage:** the merge *moves* (renames, same filesystem) rather than copies, and the scratch
 dir is deleted afterward, so peak disk is ~1× the final cache size, not 2×. Budget roughly the size
-of the latents cache you're building (plus your source shards, which the jobs read in place).
+of the latents cache you're building (plus your source shards, which the jobs read in place). To
+watch usage, use `du -sh <cache_root>` — on a network filesystem (RunPod MooseFS etc.) `df` reports
+the *cluster* capacity, not your pod's quota, so it won't warn you before the volume fills.
 
 Your subsequent `train.py --trust_cache` run then adopts that merged cache and only has to build
 text-embeddings (fast) before training.

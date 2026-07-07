@@ -52,7 +52,7 @@ Top-level keys (see `examples/main_example.toml`, `examples/wan_14b_min_vram.tom
 
 - `output_dir`, `dataset` (path to a dataset TOML), `epochs` **or** `max_steps`
 - `micro_batch_size_per_gpu` (int, or per-resolution `[[512,4],[1024,1]]`), `gradient_accumulation_steps`
-- `save_every_n_epochs` / `save_every_n_steps`, `checkpoint_every_n_minutes`
+- `save_every_n_epochs` / `save_every_n_steps` / `save_every_n_examples` (adapter export cadence; `examples` = per N training samples, auto-converted to steps by the global batch size), `checkpoint_every_n_minutes` (DeepSpeed resume checkpoint)
 - `activation_checkpointing` (bool or `'unsloth'`), `pipeline_stages`, `blocks_to_swap` (RAM offload)
 - `gradient_clipping`, `warmup_steps`, `lr_scheduler`
 - `caching_batch_size`, `map_num_proc` (caching parallelism), `compile`
@@ -150,6 +150,20 @@ decode-pool deadlock), merges per-bucket latents into the config's cache root, a
 different, so a cache built for one column crashes a phase reading another. **Cache each phase into
 its own cache root.** Full design, deadlock diagnosis, and troubleshooting: [docs/multigpu_caching.md](docs/multigpu_caching.md).
 
+### Long training runs — checkpoint pruning + disk
+
+`checkpoint_every_n_minutes` (and each adapter save) writes a `global_stepN/` **DeepSpeed resume
+checkpoint** (~0.5–2 GB) that is **never auto-pruned** — over a multi-day run these accumulate and can
+silently fill the volume. `prune_checkpoints.py` keeps only the newest few and deletes older ones (it
+never touches exported `adapter_model.safetensors`); run it as a daemon alongside training:
+
+```bash
+python prune_checkpoints.py <output_dir> --keep 3 --interval 900 --until <output_dir>/../DONE
+```
+
+**Disk gotcha on network volumes** (RunPod MooseFS etc.): `df` reports the *cluster* capacity (hundreds
+of TB), NOT your pod's quota — it is useless for spotting a fill-up. Use `du -sh <dir>` for real usage.
+
 ## Key utils
 
 - `utils/dataset.py` — dataset loading + caching orchestration (`make_cache` factory,
@@ -176,6 +190,7 @@ python test/test_bucket_manifest.py
 python test/test_subject_bucket.py
 python test/test_latents_decouple.py
 python test/test_cache_multigpu.py   # multi-GPU cache driver (needs `toml`; no torch/GPU)
+python test/test_prune_checkpoints.py   # resume-checkpoint pruner (no torch/GPU)
 ```
 
 ## Conventions

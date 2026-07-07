@@ -27,6 +27,17 @@ CLI:
 Then in your dataset toml's [[directory]]:
     bucket_manifest = 'manifest_vlm.json'
     manifest_key_column = 'id'
+
+TUNING (learned the hard way): dampened_repeats LIFTS the rare-subject tail, so the DEFAULTS
+(alpha=0.5, max_repeats=8) can blow the effective dataset up ~4x (most rare buckets hit the
+max_repeats cap) -> ~4x longer training. Pick alpha/max_repeats for a target multiplier: higher
+alpha and/or lower max_repeats = gentler. On one 79k-survivor set: (0.5,8)->4.3x, (0.7,3)->2.3x,
+(0.8,3)->1.75x, (0.85,2)->1.44x, (1.0,*)->1.0x (no bucketing). The manifest is keyed by row id and
+only sets per-row num_repeats, which is EXCLUDED from the latents fingerprint (image_spec-keyed
+read) -- so you can add/change a manifest and re-run WITHOUT re-encoding latents: only the
+iteration_order (and text-embeddings if captions changed) rebuild. To size a manifest before
+committing to a run, load it and sum num_repeats: `sum(r['num_repeats'] for r in
+json.load(open(m))['rows'].values()) / len(rows)` is the effective multiplier.
 """
 
 import os
