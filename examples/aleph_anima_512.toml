@@ -15,7 +15,7 @@ gradient_clipping = 1
 save_every_n_steps = 2500
 checkpoint_every_n_minutes = 60
 activation_checkpointing = true
-save_dtype = 'float32'
+save_dtype = 'bfloat16'   # dtype law: match the trunk
 caching_batch_size = 8
 
 [model]

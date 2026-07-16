@@ -117,7 +117,10 @@ def attach_aleph_relays(transformer, model_channels: int, every: int = 1,
     """Attach RelayPatch2D to transformer.blocks[i] for i % every == 0, AFTER
     the DiT is materialized (never under init_empty_weights — fresh relays are
     not in the trunk state dict and would be left on meta). Returns site count.
-    relay_path: optional saved stack {'relays': {block_idx: state_dict}}."""
+    relay_path: optional saved stack {'relays': {block_idx: state_dict}}.
+    DTYPE LAW (Phil 2026-07-16): adapter dtype MATCHES the trunk block dtype —
+    an fp32 adapter on a bf16 trunk spins fp32 noise into the environment;
+    test at the model's actual fp/bf sizes. Gauges stay fp32 downstream."""
     saved = None
     if relay_path is not None:
         saved = torch.load(relay_path, map_location="cpu", weights_only=True)
@@ -131,7 +134,8 @@ def attach_aleph_relays(transformer, model_channels: int, every: int = 1,
         else:
             relay = RelayPatch2D(model_channels)
             relay.assert_zero_init()
-        block.aleph_relay = relay.float()          # adapter params stay fp32
+        block_dtype = next(block.parameters()).dtype
+        block.aleph_relay = relay.to(block_dtype)  # dtype-matched to trunk
         n += 1
     return n
 
