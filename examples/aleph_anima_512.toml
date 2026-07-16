@@ -1,0 +1,50 @@
+# exp004 (r2 diffusion aleph line): Anima 2B DiT + per-block aleph relays.
+# Frozen trunk (every non-relay lr = 0), fp32 relay adapters (zero-init W+b,
+# gate -3.0), pure Adam wd=0 (the 'adam' branch added on feat/aleph-adapter).
+# Anima weights are NC (CircleStone NC + NVIDIA OML) — derived checkpoints too.
+
+output_dir = '/workspace/ckpts2/aleph_anima_512'
+dataset = 'examples/aleph_anima_dataset.toml'
+
+epochs = 1
+max_steps = 5000
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+save_every_n_steps = 2500
+checkpoint_every_n_minutes = 60
+activation_checkpointing = true
+save_dtype = 'float32'
+caching_batch_size = 8
+
+[model]
+type = 'anima'
+# paths per repos/anima-trainer.md (circlestone-labs/Anima split_files/);
+# fill in the pod-local absolute paths at launch:
+transformer_path = '/workspace/models/anima/diffusion_models/anima-base-v1.0.safetensors'
+llm_path = '/workspace/models/anima/text_encoders/qwen_3_06b_base.safetensors'
+vae_path = '/workspace/models/anima/vae/qwen_image_vae.safetensors'
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+
+# the aleph relay stack (models/aleph_relay.py)
+aleph_relay = true
+aleph_relay_every = 1          # 'every2' is the param-efficiency arm
+aleph_relay_lr = 1e-3
+# freeze the trunk + the llm_adapter (non-negotiable: repos/anima-trainer.md)
+self_attn_lr = 0
+cross_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+llm_adapter_lr = 0
+# aleph_relay_path = '...'     # resume a saved stack
+
+[optimizer]
+type = 'adam'                  # pure Adam — NEVER adamw on aleph paths
+lr = 0                         # base bucket frozen; relays use aleph_relay_lr
+betas = [0.9, 0.99]
+weight_decay = 0.0
+
+[monitoring]
+enable_wandb = false

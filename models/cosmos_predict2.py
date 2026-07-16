@@ -24,6 +24,7 @@ from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from models.cosmos_predict2_modeling import MiniTrainDIT
+from models.aleph_relay import attach_aleph_relays, aleph_relay_state
 from utils.common import load_state_dict, AUTOCAST_DTYPE, is_main_process, iterate_safetensors
 from utils.offloading import ModelOffloader
 from models.wan.vae2_1 import WanVAE_
@@ -299,6 +300,28 @@ class CosmosPredict2Pipeline(BasePipeline):
                 dtype_to_use = dtype if (any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) or p.ndim == 1) else transformer_dtype
                 set_module_tensor_to_device(llm_adapter, name, device='cpu', dtype=dtype_to_use, value=llm_adapter_state_dict[name])
 
+        # aleph relays (feat/aleph-adapter): attach AFTER materialization
+        # (fresh modules are not in the trunk state dict — attaching under
+        # init_empty_weights would leave them on meta), BEFORE original_name
+        # stamping so param groups + saving see them.
+        self.use_aleph_relay = self.model_config.get('aleph_relay', False)
+        if self.use_aleph_relay:
+            n_sites = attach_aleph_relays(
+                transformer,
+                dit_config['model_channels'],
+                every=self.model_config.get('aleph_relay_every', 1),
+                relay_path=self.model_config.get('aleph_relay_path'),
+            )
+            if is_main_process():
+                n_params = sum(
+                    p.numel() for b in transformer.blocks
+                    for p in getattr(b, 'aleph_relay',
+                                     nn.Identity()).parameters())
+                print(f'aleph_relay: {n_sites} sites '
+                      f'(every={self.model_config.get("aleph_relay_every", 1)}'
+                      f', d={dit_config["model_channels"]}), '
+                      f'{n_params:,} adapter params, fp32')
+
         self.transformer = transformer
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
@@ -320,6 +343,19 @@ class CosmosPredict2Pipeline(BasePipeline):
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, state_dict):
+        if getattr(self, 'use_aleph_relay', False):
+            # adapter-only save: the trunk is frozen (lr=0 buckets); persist
+            # just the relay stack, loadable via [model].aleph_relay_path
+            torch.save(aleph_relay_state(self.transformer),
+                       save_dir / 'aleph_relay.pt')
+            relay_sd = {k: v for k, v in state_dict.items()
+                        if 'aleph_relay' in k}
+            if relay_sd:
+                safetensors.torch.save_file(
+                    {k: v.contiguous() for k, v in relay_sd.items()},
+                    save_dir / 'aleph_relay.safetensors',
+                    metadata={'format': 'pt'})
+            return
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
 
@@ -447,9 +483,12 @@ class CosmosPredict2Pipeline(BasePipeline):
 
     def get_param_groups(self, parameters):
         base_params, self_attn_params, cross_attn_params, mlp_params, mod_params, llm_adapter_params = [], [], [], [], [], []
+        aleph_relay_params = []
         for p in parameters:
             name = p.original_name
-            if 'llm_adapter' in name:
+            if 'aleph_relay' in name:
+                aleph_relay_params.append(p)
+            elif 'llm_adapter' in name:
                 llm_adapter_params.append(p)
             elif '.self_attn' in name:
                 self_attn_params.append(p)
@@ -468,9 +507,11 @@ class CosmosPredict2Pipeline(BasePipeline):
         mlp_lr = self.model_config.get('mlp_lr', base_lr)
         mod_lr = self.model_config.get('mod_lr', base_lr)
         llm_adapter_lr = self.model_config.get('llm_adapter_lr', base_lr)
+        aleph_relay_lr = self.model_config.get('aleph_relay_lr', base_lr)
 
         if is_main_process():
-            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}')
+            print(f'Using base_lr={base_lr}, self_attn_lr={self_attn_lr}, cross_attn_lr={cross_attn_lr}, mlp_lr={mlp_lr}, mod_lr={mod_lr}, llm_adapter_lr={llm_adapter_lr}, aleph_relay_lr={aleph_relay_lr}')
+            print(f'Num aleph_relay params: {len(aleph_relay_params)}')
             print(f'Num base params: {len(base_params)}')
             print(f'Num self_attn params: {len(self_attn_params)}')
             print(f'Num cross_attn params: {len(cross_attn_params)}')
@@ -479,7 +520,7 @@ class CosmosPredict2Pipeline(BasePipeline):
             print(f'Num llm_adapter params: {len(llm_adapter_params)}')
 
         param_groups = []
-        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params)]:
+        for lr, params in [(base_lr, base_params), (self_attn_lr, self_attn_params), (cross_attn_lr, cross_attn_params), (mlp_lr, mlp_params), (mod_lr, mod_params), (llm_adapter_lr, llm_adapter_params), (aleph_relay_lr, aleph_relay_params)]:
             if lr == 0:
                 for p in params:
                     p.requires_grad_(False)

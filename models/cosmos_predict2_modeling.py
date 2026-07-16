@@ -1139,6 +1139,11 @@ class Block(nn.Module):
         )
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
+        # aleph relay (feat/aleph-adapter): attached post-materialization by
+        # models/aleph_relay.attach_aleph_relays; no-op when absent/disabled
+        aleph_relay = getattr(self, 'aleph_relay', None)
+        if aleph_relay is not None:
+            x_B_T_H_W_D = aleph_relay(x_B_T_H_W_D)
         return x_B_T_H_W_D
 
 

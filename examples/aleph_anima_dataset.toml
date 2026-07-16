@@ -1,0 +1,69 @@
+# Example dataset config: train directly from a prepared HuggingFace / parquet dataset,
+# with the computed latents + text embeddings stored as multi-column parquet shards.
+#
+# Use it like any other dataset TOML: set `dataset = '.../anima_hf_parquet_dataset.toml'`
+# in your training config (model type 'anima', 'flux', 'sdxl', ... — the parquet path
+# is model-agnostic). The legacy flat-folder dataset format still works unchanged; this
+# is opt-in via `type` on the directory and `cache_backend = 'parquet'`.
+
+# Multi-resolution / aspect-ratio bucketing works exactly as for folder datasets, but the
+# bucket assignment is computed vectorized from the dataset's width/height columns, so no
+# image is decoded just to read its size.
+resolutions = [512]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+
+# --- Cache backend ----------------------------------------------------------
+# 'legacy' (default) = sqlite + torch.save binary shards (unchanged behavior).
+# 'parquet'          = multi-column parquet shards (HF-uploadable, columnar).
+cache_backend = 'parquet'
+cache_shard_size_mb = 350          # target on-disk size per cache shard
+# cache_row_group_size = 1         # rows per row group (1 = fastest random reads for big blobs)
+# cache_compression = 'none'       # latents/embeds are ~incompressible; 'none' avoids decompress on read
+
+# Optional: back up each finalized cache shard to a HuggingFace dataset repo, and
+# re-download missing shards on a fresh machine instead of recomputing them.
+# Requires `huggingface-cli login` (or HF_TOKEN in the environment).
+# cache_hf_repo = 'AbstractPhil/r2-aleph-anima-cache'
+# cache_hf_upload = true
+
+# Optional: batched GPU resize during caching (default off => CPU PIL resize, the
+# correctness baseline). Enabling changes the latents cache fingerprint so the GPU
+# and CPU caches don't clobber each other.
+# resize_on_gpu = true
+
+# How many whole source-shard image columns to hold in RAM per decode worker during
+# caching. Set this >= the number of shards in your config for single-pass caching.
+parquet_shard_lru = 8
+
+[[directory]]
+type = 'huggingface'                                  # 'huggingface' | 'parquet' | 'directory' (default)
+dataset = 'AbstractPhil/diffusion-pretrain-set-ft1'   # HF dataset repo id
+config = 'deepfashion'                                # HF config (subfolder under data/)
+split = 'train'
+image_column = 'image'                                # HF Image feature (struct<bytes, path>)
+width_column = 'image_width'                          # int columns => AR bucketing with no PIL peek
+height_column = 'image_height'
+caption_column = 'caption_vlm_json'                   # a column name, or a list for multi-prompt
+caption_type = 'json'                                 # 'text' (verbatim) or 'json' (parse + flatten)
+# caption_json_path = 'deepfashion_caption'           # dot-path into the JSON (e.g. for captions_source_json)
+num_repeats = 1
+skip_empty_caption = true
+# path = '/abs/path/to/cache_root'                    # override where the computed cache is written
+                                                      # (default: ~/.cache/diffusion-pipe/parquet/<dataset>__<config>__<split>)
+
+# Multi-prompt example: two caption columns -> two captions per image.
+# caption_column = ['caption_vlm_json', 'captions_source_json']
+
+# Local parquet files instead of a HF repo:
+# [[directory]]
+# type = 'parquet'
+# parquet_files = '/data/my_dataset/*.parquet'        # glob string or list of paths
+# image_column = 'image'
+# width_column = 'image_width'
+# height_column = 'image_height'
+# caption_column = 'caption'
+# caption_type = 'text'
+# num_repeats = 1

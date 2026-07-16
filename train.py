@@ -669,6 +669,10 @@ if __name__ == '__main__':
         elif optim_type_lower == 'stableadamw':
             import optimi
             klass = optimi.StableAdamW
+        elif optim_type_lower == 'adam':
+            # plain Adam (feat/aleph-adapter): required on aleph paths (pure
+            # Adam wd=0 house rule; never AdamW there)
+            klass = torch.optim.Adam
         elif optim_type_lower == 'sgd':
             klass = torch.optim.SGD
         elif optim_type_lower == 'adamw8bitkahan':
