@@ -311,6 +311,7 @@ class CosmosPredict2Pipeline(BasePipeline):
                 dit_config['model_channels'],
                 every=self.model_config.get('aleph_relay_every', 1),
                 relay_path=self.model_config.get('aleph_relay_path'),
+                dtype=dtype,
             )
             if is_main_process():
                 n_params = sum(

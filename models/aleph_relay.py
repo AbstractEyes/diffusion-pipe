@@ -113,7 +113,8 @@ class RelayPatch2D(nn.Module):
 
 
 def attach_aleph_relays(transformer, model_channels: int, every: int = 1,
-                        relay_path: str | None = None) -> int:
+                        relay_path: str | None = None,
+                        dtype: torch.dtype | None = None) -> int:
     """Attach RelayPatch2D to transformer.blocks[i] for i % every == 0, AFTER
     the DiT is materialized (never under init_empty_weights — fresh relays are
     not in the trunk state dict and would be left on meta). Returns site count.
@@ -134,8 +135,10 @@ def attach_aleph_relays(transformer, model_channels: int, every: int = 1,
         else:
             relay = RelayPatch2D(model_channels)
             relay.assert_zero_init()
-        block_dtype = next(block.parameters()).dtype
-        block.aleph_relay = relay.to(block_dtype)  # dtype-matched to trunk
+        # dtype law: use the DECLARED trunk dtype (sniffing the first
+        # param can read a still-meta fp32 tensor — caught by the R0b gate)
+        block_dtype = dtype or next(block.parameters()).dtype
+        block.aleph_relay = relay.to(block_dtype)
         n += 1
     return n
 
