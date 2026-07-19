@@ -3,7 +3,7 @@
 # gate -3.0), pure Adam wd=0 (the 'adam' branch added on feat/aleph-adapter).
 # Anima weights are NC (CircleStone NC + NVIDIA OML) — derived checkpoints too.
 
-output_dir = '/workspace/ckpts2/aleph_anima_512'
+output_dir = '/workspace/ckpts2/anima_lora_ctrl'
 dataset = '/workspace/geolip2/pod2/exp004_dataset.toml'
 
 epochs = 4
@@ -28,23 +28,22 @@ vae_path = '/workspace/models/anima/split_files/vae/qwen_image_vae.safetensors'
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
 
-# the aleph relay stack (models/aleph_relay.py)
-aleph_relay = true
-aleph_relay_every = 1          # 'every2' is the param-efficiency arm
-aleph_relay_lr = 1e-3
 # freeze the trunk + the llm_adapter (non-negotiable: repos/anima-trainer.md)
-self_attn_lr = 0
-cross_attn_lr = 0
-mlp_lr = 0
-mod_lr = 0
-llm_adapter_lr = 0
-# aleph_relay_path = '...'     # resume a saved stack
+self_attn_lr = 1e-3
+cross_attn_lr = 1e-3
+mlp_lr = 1e-3
+mod_lr = 1e-3
+llm_adapter_lr = 1e-3
 
 [optimizer]
 type = 'adam'                  # pure Adam — NEVER adamw on aleph paths
-lr = 0                         # base bucket frozen; relays use aleph_relay_lr
 betas = [0.9, 0.99]
 weight_decay = 0.0
 
 [monitoring]
 enable_wandb = false
+
+[adapter]
+type = 'lora'
+rank = 16
+dtype = 'bfloat16'
