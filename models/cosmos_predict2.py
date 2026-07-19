@@ -312,6 +312,8 @@ class CosmosPredict2Pipeline(BasePipeline):
                 every=self.model_config.get('aleph_relay_every', 1),
                 relay_path=self.model_config.get('aleph_relay_path'),
                 dtype=dtype,
+                mode=self.model_config.get('aleph_relay_mode', 'relay'),
+                rank=self.model_config.get('aleph_relay_rank', 16),
             )
             if is_main_process():
                 n_params = sum(
@@ -319,9 +321,10 @@ class CosmosPredict2Pipeline(BasePipeline):
                     for p in getattr(b, 'aleph_relay',
                                      nn.Identity()).parameters())
                 print(f'aleph_relay: {n_sites} sites '
-                      f'(every={self.model_config.get("aleph_relay_every", 1)}'
+                      f'(mode={self.model_config.get("aleph_relay_mode", "relay")}'
+                      f', every={self.model_config.get("aleph_relay_every", 1)}'
                       f', d={dit_config["model_channels"]}), '
-                      f'{n_params:,} adapter params, fp32')
+                      f'{n_params:,} adapter params, dtype={dtype}')
 
         self.transformer = transformer
         self.transformer.train()
@@ -345,17 +348,28 @@ class CosmosPredict2Pipeline(BasePipeline):
 
     def save_model(self, save_dir, state_dict):
         if getattr(self, 'use_aleph_relay', False):
-            # adapter-only save: the trunk is frozen (lr=0 buckets); persist
-            # just the relay stack, loadable via [model].aleph_relay_path
-            torch.save(aleph_relay_state(self.transformer),
+            # adapter-only save: the trunk is frozen (lr=0 buckets). The .pt
+            # carries BOTH shapes (fork-legacy {'relays'} for resume via
+            # [model].aleph_relay_path AND amoe.diffusion.anchor v1 fields,
+            # loadable by amoe.diffusion.load_diffusion_anchor unchanged).
+            torch.save(aleph_relay_state(
+                self.transformer,
+                meta={'objective': {'kind': 'flow'},
+                      'mode': self.model_config.get('aleph_relay_mode',
+                                                    'relay')}),
                        save_dir / 'aleph_relay.pt')
             relay_sd = {k: v for k, v in state_dict.items()
                         if 'aleph_relay' in k}
             if relay_sd:
+                # ComfyUI-prefixed keys — the same convention as the peft
+                # save_adapter path above ('diffusion_model.' + trunk path)
                 safetensors.torch.save_file(
-                    {k: v.contiguous() for k, v in relay_sd.items()},
+                    {'diffusion_model.' + k: v.contiguous()
+                     for k, v in relay_sd.items()},
                     save_dir / 'aleph_relay.safetensors',
-                    metadata={'format': 'pt'})
+                    metadata={'format': 'pt',
+                              'amoe_format': 'amoe.diffusion.anchor',
+                              'key_layout': 'comfy'})
             return
         state_dict = {'net.'+k: v for k, v in state_dict.items()}
         safetensors.torch.save_file(state_dict, save_dir / 'model.safetensors', metadata={'format': 'pt'})
@@ -649,6 +663,14 @@ class TransformerLayer(nn.Module):
         x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D, adaln_lora_B_T_3D, timesteps_B_T = inputs
 
         self.offloader.wait_for_block(self.block_idx)
+        # multiband aleph adapters need per-sample band windows from the
+        # sampled t (flow s01 in (0,1], t=1 = pure noise). timesteps ride
+        # the pipeline inputs, so this works on any stage.
+        ar = getattr(self.block, 'aleph_relay', None)
+        if ar is not None and getattr(ar, 'needs_bands', False):
+            from models.aleph_relay import band_weights
+            self.block.aleph_w_bands = band_weights(
+                timesteps_B_T.float().mean(dim=1))
         x_B_T_H_W_D = self.block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, rope_emb_L_1_1_D=rope_emb_L_1_1_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 

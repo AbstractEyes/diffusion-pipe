@@ -406,6 +406,28 @@ class SDXLPipeline(BasePipeline):
         self.unet.train()
         self.text_encoder.train()
         self.text_encoder_2.train()
+
+        # aleph relays (amoe bake-in): wrap every BasicTransformerBlock,
+        # AFTER from_single_file materialization (real weights — no meta
+        # hazard), BEFORE original_name stamping so param groups + saves
+        # key on 'aleph_relay'. Freeze the trunk via unet_lr = 0 etc.
+        self.use_aleph_relay = self.model_config.get('aleph_relay', False)
+        if self.use_aleph_relay:
+            assert 'adapter' not in self.config, \
+                'aleph_relay and a peft adapter cannot both be configured'
+            from models.aleph_relay import attach_unet_relays
+            n_sites = attach_unet_relays(
+                self.unet,
+                relay_path=self.model_config.get('aleph_relay_path'),
+                dtype=self.model_config['dtype'],   # DECLARED dtype (law)
+                mode=self.model_config.get('aleph_relay_mode', 'relay'),
+                rank=self.model_config.get('aleph_relay_rank', 16),
+            )
+            if is_main_process():
+                print(f'aleph_relay(sdxl): {n_sites} sites, '
+                      f'dtype={self.model_config["dtype"]}, '
+                      f'objective={"v" if self.v_pred else "eps"}')
+
         self._set_param_original_name()
 
     def __getattr__(self, name):
@@ -485,6 +507,25 @@ class SDXLPipeline(BasePipeline):
         self._set_param_original_name()
 
     def save_model(self, save_dir, diffusers_sd):
+        if getattr(self, 'use_aleph_relay', False):
+            # adapter-only save (the trunk is frozen): dual-shape .pt
+            # (fork-legacy resume + amoe.diffusion.anchor v1) + a
+            # diffusers-path-prefixed safetensors. The ldm/comfy key
+            # mapping for SDXL relays is pinned at ComfyUI-node time
+            # (F2), so the safetensors carries the diffusers paths.
+            from models.aleph_relay import unet_aleph_state
+            torch.save(unet_aleph_state(
+                self.unet,
+                meta={'objective': {'kind': 'v' if self.v_pred else 'eps'}}),
+                       save_dir / 'aleph_relay.pt')
+            relay_sd = {k: v.contiguous() for k, v in diffusers_sd.items()
+                        if 'aleph_relay' in k}
+            if relay_sd:
+                save_file(relay_sd, save_dir / 'aleph_relay.safetensors',
+                          metadata={'format': 'pt',
+                                    'amoe_format': 'amoe.diffusion.anchor',
+                                    'key_layout': 'diffusers_prefixed'})
+            return
         unet_state_dict, text_enc_dict, text_enc_2_dict = {}, {}, {}
         for name, p in diffusers_sd.items():
             if name.startswith('unet.'):
@@ -601,8 +642,11 @@ class SDXLPipeline(BasePipeline):
 
     def get_param_groups(self, parameters):
         unet_params, text_encoder_params, text_encoder_2_params = [], [], []
+        aleph_relay_params = []
         for p in parameters:
-            if p.original_name.startswith('unet.'):
+            if 'aleph_relay' in p.original_name:
+                aleph_relay_params.append(p)
+            elif p.original_name.startswith('unet.'):
                 unet_params.append(p)
             elif p.original_name.startswith('text_encoder.'):
                 text_encoder_params.append(p)
@@ -614,6 +658,29 @@ class SDXLPipeline(BasePipeline):
         unet_lr = self.model_config.get('unet_lr', base_lr)
         text_encoder_lr = self.model_config.get('text_encoder_1_lr', base_lr)
         text_encoder_2_lr = self.model_config.get('text_encoder_2_lr', base_lr)
+        aleph_relay_lr = self.model_config.get('aleph_relay_lr', base_lr)
+        if getattr(self, 'use_aleph_relay', False):
+            # cosmos-path semantics: lr==0 buckets are FROZEN outright
+            for lr, params in ((unet_lr, unet_params),
+                               (text_encoder_lr, text_encoder_params),
+                               (text_encoder_2_lr, text_encoder_2_params)):
+                if lr == 0:
+                    for p in params:
+                        p.requires_grad_(False)
+            groups = []
+            if aleph_relay_params:
+                groups.append({'params': aleph_relay_params,
+                               'lr': aleph_relay_lr})
+            for lr, params in ((unet_lr, unet_params),
+                               (text_encoder_lr, text_encoder_params),
+                               (text_encoder_2_lr, text_encoder_2_params)):
+                if lr not in (0, None) and params:
+                    groups.append({'params': params, 'lr': lr})
+            if is_main_process():
+                print(f'aleph(sdxl) param groups: '
+                      f'{len(aleph_relay_params)} aleph params @ '
+                      f'{aleph_relay_lr}; trunk buckets frozen at lr=0')
+            return groups
         if is_main_process():
             print(f'Using unet_lr={unet_lr}, text_encoder_1_lr={text_encoder_lr}, text_encoder_2_lr={text_encoder_2_lr}')
         unet_param_group = {'params': unet_params}

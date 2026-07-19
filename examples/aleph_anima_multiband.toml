@@ -1,0 +1,51 @@
+# Anima 2B DiT + MULTIBAND aleph adapters (amoe bake-in).
+# Three band experts per block combined by cosine crossfade windows on the
+# sigma axis (band edges/xfade are LAW constants from the certified r2
+# exp008 mechanism — surgical band lesions 2-seed — not config keys).
+# The pipeline sets per-micro-batch windows from the sampled t; works at
+# pipeline_stages = 1 (stages > 1: timesteps ride the layer inputs, but
+# multiband is smoke-deferred there).
+# Anima weights are NC (CircleStone NC + NVIDIA OML) — derived ckpts too.
+
+output_dir = '/workspace/ckpts2/aleph_anima_multiband'
+dataset = 'examples/aleph_anima_dataset.toml'
+
+epochs = 4
+max_steps = 3000
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 0
+save_every_n_steps = 2500
+checkpoint_every_n_minutes = 60
+activation_checkpointing = true
+save_dtype = 'bfloat16'   # dtype law: match the trunk
+caching_batch_size = 8
+
+[model]
+type = 'anima'
+transformer_path = '/workspace/models/anima/split_files/diffusion_models/anima-base-v1.0.safetensors'
+llm_path = '/workspace/models/anima/split_files/text_encoders/qwen_3_06b_base.safetensors'
+vae_path = '/workspace/models/anima/split_files/vae/qwen_image_vae.safetensors'
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+
+aleph_relay = true
+aleph_relay_mode = 'multiband3'   # 3 band experts / site, window-combined
+aleph_relay_rank = 16             # per-band rank (the certified default)
+aleph_relay_every = 1
+aleph_relay_lr = 1e-3
+self_attn_lr = 0
+cross_attn_lr = 0
+mlp_lr = 0
+mod_lr = 0
+llm_adapter_lr = 0
+
+[optimizer]
+type = 'adam'                     # pure Adam — NEVER adamw on aleph paths
+lr = 0
+betas = [0.9, 0.99]
+weight_decay = 0.0
+
+[monitoring]
+enable_wandb = false

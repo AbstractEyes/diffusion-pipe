@@ -645,6 +645,20 @@ if __name__ == '__main__':
         optim_type = optim_config['type']
         optim_type_lower = optim_type.lower()
 
+        # house law (aleph line): pure Adam wd=0, NEVER AdamW/weight decay
+        # on aleph adapter paths — weight decay destroys the zero-init
+        # inertness contract. Hard error, not a warning.
+        if config['model'].get('aleph_relay', False):
+            if optim_type_lower != 'adam':
+                raise ValueError(
+                    f"[optimizer] type = '{optim_type}' with aleph_relay "
+                    "configured — aleph paths require type = 'adam' "
+                    "(pure Adam, weight_decay 0)")
+            if optim_config.get('weight_decay', 0.0) not in (0, 0.0):
+                raise ValueError(
+                    "aleph_relay requires weight_decay = 0 (the zero-init "
+                    "inertness contract)")
+
         if beta2_half_life := optim_config.pop('beta2_half_life', None):
             betas = optim_config['betas']
             assert len(betas) == 2

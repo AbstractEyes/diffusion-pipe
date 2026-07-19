@@ -12,6 +12,20 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Seemlessly supports both image and video models in a unified way
 - Easily add new models by implementing a single subclass
 
+## Aleph adapters (amoe-lora bake-in)
+
+This fork trains **aleph adapters** ([amoe-lora](https://huggingface.co/AbstractPhil/amoe-lora))
+on frozen diffusion trunks — the multi-GPU production path of that
+framework, proven end-to-end on the Anima 2B DiT. Two modes on the
+cosmos-predict2/anima path (`aleph_relay_mode = 'relay' | 'multiband3'`)
+and relay mode on SDXL. Adapter-only saves are written in the
+`amoe.diffusion.anchor` format (loadable by `amoe.diffusion` directly)
+plus a ComfyUI-prefixed safetensors. `pip install amoe-lora[diffusion]`
+makes the fork use the package's certified classes; without it a vendored
+fallback keeps the fork standalone. See `examples/aleph_*.toml`; aleph
+paths require `[optimizer] type = 'adam'` with `weight_decay = 0`
+(enforced). Research record: [geolip-aleph-diffusion](https://huggingface.co/AbstractPhil/geolip-aleph-diffusion).
+
 ## Recent changes
 - 2026-06-26
   - Train directly from parquet / HuggingFace datasets, and optionally store the latent/text-embedding cache as HF-uploadable multi-column parquet shards. Opt-in and model-agnostic; the legacy folder dataset and binary cache are unchanged. See the [Parquet / HuggingFace datasets](#parquet--huggingface-datasets-and-the-parquet-cache-backend) section.

@@ -1140,10 +1140,16 @@ class Block(nn.Module):
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
         # aleph relay (feat/aleph-adapter): attached post-materialization by
-        # models/aleph_relay.attach_aleph_relays; no-op when absent/disabled
+        # models/aleph_relay.attach_aleph_relays; no-op when absent/disabled.
+        # Multiband modules consume per-sample band windows the pipeline
+        # stashes at aleph_w_bands (set from the sampled t each micro-batch).
         aleph_relay = getattr(self, 'aleph_relay', None)
         if aleph_relay is not None:
-            x_B_T_H_W_D = aleph_relay(x_B_T_H_W_D)
+            if getattr(aleph_relay, 'needs_bands', False):
+                x_B_T_H_W_D = aleph_relay(
+                    x_B_T_H_W_D, getattr(self, 'aleph_w_bands', None))
+            else:
+                x_B_T_H_W_D = aleph_relay(x_B_T_H_W_D)
         return x_B_T_H_W_D
 
 
