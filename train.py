@@ -424,6 +424,24 @@ if __name__ == '__main__':
         'gradient_clipping': 0. if gradient_release else config.get('gradient_clipping', 1.0),
         'steps_per_print': config.get('steps_per_print', 1),
     }
+    # bf16_master_weights (opt-in): keep fp32 MASTER weights over the client
+    # optimizer while the module stays bf16. Without this, a plain optimizer
+    # steps DIRECTLY on bf16 leaves, and any per-step update smaller than
+    # half a bf16 ULP at the weight's magnitude rounds to a NO-OP. Measured
+    # on the r2 exp004 aleph run: all 28 relay gates (init -3.0, half-ULP
+    # there 0.0078) had live Adam gradient state implying ~4.5e-4 steps —
+    # every one of them rounded away, so the gates were frozen by
+    # quantization for the entire run while near-zero weights trained fine.
+    # Mandatory for adapter training on bf16 trunks (large-magnitude
+    # scalars); costs 4 bytes/param of master copy.
+    if config.get('bf16_master_weights', False):
+        model_dtype = config['model'].get('dtype', None)   # DTYPE_MAP-converted
+        if model_dtype != torch.bfloat16:
+            raise ValueError(
+                "bf16_master_weights = true requires [model] dtype = "
+                f"'bfloat16' (got {model_dtype}) — fp32 and fp16 models "
+                "do not have this failure mode.")
+        ds_config['bf16'] = {'enabled': True}
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
