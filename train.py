@@ -298,6 +298,19 @@ if __name__ == '__main__':
     # needed for broadcasting Queue in dataset.py
     torch.cuda.set_device(local_rank)
 
+    # Optional top-level `seed` key: makes adapter/init randomness a DECLARED
+    # experimental variable instead of process entropy. Without it, "seed 0"
+    # vs "seed 1" runs of the same config differ only by whatever state the
+    # fresh process happened to start with — unreproducible by construction.
+    # Rank-offset so multi-GPU workers do not draw identical streams.
+    if (run_seed := config.get('seed', None)) is not None:
+        run_seed = int(run_seed) + get_rank()
+        random.seed(run_seed)
+        np.random.seed(run_seed)
+        torch.manual_seed(run_seed)
+        if is_main_process():
+            print(f'Seeded run: seed={run_seed} (config seed + rank)')
+
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
         else config.get('resume_from_checkpoint', False)
