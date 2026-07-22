@@ -24,8 +24,16 @@ except ModuleNotFoundError:
 from deepspeed.accelerator import get_accelerator
 
 from . import reduction
-import hyvideo.text_encoder
-from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
+try:
+    # Optional: resolves only when submodules/HunyuanVideo is initialized.
+    # Model families import lazily on main; this module-level import must
+    # not be the one thing that forces the submodule onto environments that
+    # never train hyvideo (its only use is the load_text_encoder patch).
+    import hyvideo.text_encoder
+    from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
+    _HAS_HYVIDEO = True
+except ImportError:
+    _HAS_HYVIDEO = False
 
 from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, apply_mod
 from comfy.ldm.flux.math import attention
@@ -411,7 +419,8 @@ def apply_patches():
     peft.tuners.tuners_utils.BaseTunerLayer._move_adapter_to_device_of_base_layer = _move_adapter_to_device_of_base_layer
 
     # Use torch_dtype to avoid needlessly loading the text encoder in float32, only to cast it right after.
-    hyvideo.text_encoder.load_text_encoder = load_text_encoder
+    if _HAS_HYVIDEO:
+        hyvideo.text_encoder.load_text_encoder = load_text_encoder
 
     # LoadMicroBatch before sending / receiving activations so we can avoid a deadlock and broadcast the target
     # from the first stage to the last stage. InferenceSchedule already has the commands in the right order
