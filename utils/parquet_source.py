@@ -18,6 +18,7 @@ import glob
 import json
 from collections import OrderedDict
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 
@@ -278,7 +279,18 @@ class ParquetImageReader:
         if pf is None:
             pf = pq.ParquetFile(parquet_path, memory_map=True)
             self._files[parquet_path] = pf
-        arr = pf.read(columns=[image_column]).column(image_column)
+        # Read per ROW GROUP, not whole-file: a nested (struct) column whose
+        # total bytes exceed 2GiB cannot be delivered by a whole-file read
+        # (ArrowNotImplementedError: "Nested data conversions not implemented
+        # for chunked array outputs"). Each row group is written small, so
+        # per-rg reads always yield in-limit chunks; the assembled
+        # ChunkedArray indexes globally exactly like the whole-file column.
+        chunks = []
+        for rg in range(pf.num_row_groups):
+            chunks.extend(pf.read_row_group(rg, columns=[image_column])
+                          .column(image_column).chunks)
+        arr = (pa.chunked_array(chunks) if chunks
+               else pf.read(columns=[image_column]).column(image_column))
         self._cols[key] = arr
         while len(self._cols) > self.lru:
             old_key, _ = self._cols.popitem(last=False)
