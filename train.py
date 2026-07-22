@@ -447,6 +447,10 @@ if __name__ == '__main__':
     # quantization for the entire run while near-zero weights trained fine.
     # Mandatory for adapter training on bf16 trunks (large-magnitude
     # scalars); costs 4 bytes/param of master copy.
+    # Mechanism: CLIENT-SIDE (utils/master_adam.py), selected at optimizer
+    # creation. NEVER via ds_config['bf16'] — that makes DeepSpeed wrap the
+    # client optimizer (FP16_UnfusedOptimizer), which the torch lr
+    # schedulers below reject ("FP16_UnfusedOptimizer is not an Optimizer").
     if config.get('bf16_master_weights', False):
         model_dtype = config['model'].get('dtype', None)   # DTYPE_MAP-converted
         if model_dtype != torch.bfloat16:
@@ -454,7 +458,10 @@ if __name__ == '__main__':
                 "bf16_master_weights = true requires [model] dtype = "
                 f"'bfloat16' (got {model_dtype}) — fp32 and fp16 models "
                 "do not have this failure mode.")
-        ds_config['bf16'] = {'enabled': True}
+        if config['optimizer']['type'].lower() != 'adam':
+            raise ValueError(
+                "bf16_master_weights = true is implemented for [optimizer] "
+                "type = 'adam' only (MasterWeightsAdam)")
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
@@ -718,6 +725,11 @@ if __name__ == '__main__':
             # plain Adam (feat/aleph-adapter): required on aleph paths (pure
             # Adam wd=0 house rule; never AdamW there)
             klass = torch.optim.Adam
+            if config.get('bf16_master_weights', False):
+                # fp32 masters over the bf16 leaves (sub-ULP freeze fix);
+                # still a torch.optim.Adam, so the schedulers below work
+                from utils.master_adam import MasterWeightsAdam
+                klass = MasterWeightsAdam
         elif optim_type_lower == 'sgd':
             klass = torch.optim.SGD
         elif optim_type_lower == 'adamw8bitkahan':
