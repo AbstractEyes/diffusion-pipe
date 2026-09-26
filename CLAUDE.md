@@ -61,6 +61,7 @@ Top-level keys (see `examples/main_example.toml`, `examples/wan_14b_min_vram.tom
 - `[adapter]` — `type='lora'|'lokr'`, `rank`, `alpha` (the trainer enforces `alpha=rank`), `dtype`, `dropout`, `init_from_existing` (path to a prior LoRA to continue from)
 - `[optimizer]` — `type` (e.g. `'adamw'`, `'adamw_optimi'`, `'AdamW8bitKahan'`), `lr`, optional `betas`/`weight_decay`/`eps`
 - `[monitoring]` — `enable_wandb`, `wandb_*`
+- `[samples]` — opt-in training previews rendered at every save (see "Training previews" below)
 
 ### Model types (`[model].type`)
 
@@ -71,6 +72,33 @@ Dispatched in `train.py` (~line 312). Supported: `flux`, `ltx-video`, `hunyuan-v
 
 - **Anima** = `type='anima'` → `models/cosmos_predict2.py`; uses a Qwen3-0.6B text encoder +
   `qwen_image_vae`. Public weights: `circlestone-labs/Anima` (`split_files/diffusion_models/anima-base-v1.0.safetensors`, `split_files/vae/qwen_image_vae.safetensors`, `split_files/text_encoders/qwen_3_06b_base.safetensors`). Anima text embeds are fixed-length 512; latents/embeds are bf16 (dtype preservation matters).
+
+## Training previews (`[samples]`, opt-in)
+
+`utils/previews.py` renders a few fixed prompts with the in-training weights at every adapter save (and once
+before the first step), so progress is visible without a separate inference setup:
+
+```toml
+[samples]
+prompts = ['a lighthouse on a cliff at dusk', 'an empty office at night']
+negative_prompt = ''        # used when cfg > 1
+width = 1024                # multiples of 16
+height = 1024
+steps = 30
+cfg = 4.0
+shift = 3.0                 # flow-matching sampling shift (3.0 matches ComfyUI's Anima setting)
+seed = 42                   # prompt i starts from seed + i at every save, so saves are comparable
+before_first_step = true    # render the untouched model once at step 0 (skipped on resume)
+```
+
+- Output: `<run_dir>/samples/<save name>/NN_<slug>.png` + `prompts.txt`; TensorBoard `samples/NN` images.
+- How: the prompts are encoded once right after caching (the text encoders and VAE stay on the CPU instead
+  of being freed; the text encoders are freed after encoding). At each save every data-parallel rank renders
+  its share of the prompts with the model's own `sample()` (Euler flow matching, CFG), then all ranks meet at a
+  barrier. A rendering error is printed and skipped; previews never stop training.
+- Needs `get_conds()` + `vae_decode()` on the model (anima / cosmos_predict2 implements both), text
+  embeddings from the pipeline text encoders, and `pipeline_stages = 1`; `train.py` fails at startup otherwise.
+- Cost per save ≈ prompts × steps × 2 forward passes (cfg > 1) + one VAE decode each, divided across the GPUs.
 
 ## Config: dataset TOML
 
@@ -191,6 +219,7 @@ python test/test_subject_bucket.py
 python test/test_latents_decouple.py
 python test/test_cache_multigpu.py   # multi-GPU cache driver (needs `toml`; no torch/GPU)
 python test/test_prune_checkpoints.py   # resume-checkpoint pruner (no torch/GPU)
+python test/test_previews.py   # training previews: config, rank split, rendering flow, failure isolation (CPU)
 ```
 
 ## Conventions

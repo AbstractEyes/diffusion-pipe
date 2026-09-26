@@ -240,6 +240,42 @@ class CommonPipeline:
             self.unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))
         self.sample_cfg = cfg
 
+    @torch.no_grad()
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def encode_sample_prompt(self, prompt, negative_prompt='', cfg=1):
+        # Same encoding as prepare_sample_test(), but returned (as CPU tensors) instead of stored, so the
+        # conditioning for several prompts can be kept for the whole run (training previews).
+        inputs = {}
+        inputs_uncond = {}
+        for te in self.get_text_encoders():
+            if isinstance(te, nn.Module):
+                te = te.to('cuda')
+            else:
+                te.load_model_if_needed()
+            call_text_encoder_fn = self.get_call_text_encoder_fn(te)
+            inputs.update(call_text_encoder_fn([prompt], is_video=[False]))
+            if cfg > 1:
+                inputs_uncond.update(call_text_encoder_fn([negative_prompt], is_video=[False]))
+            if isinstance(te, nn.Module):
+                te = te.to('cpu')
+            else:
+                model_management.unload_all_models()
+        conds = tuple(tensor.cpu() for tensor in self.get_conds(inputs))
+        unconds = tuple(tensor.cpu() for tensor in self.get_conds(inputs_uncond)) if cfg > 1 else None
+        return conds, unconds
+
+    def set_sample_schedule(self, steps, shift):
+        # Flow-matching Euler schedule used by sample(): `steps` steps, sigmas shifted by `shift`.
+        self.sample_steps = steps
+        self.sample_shift = shift
+        self.scheduler = FlowMatchEulerDiscreteScheduler(shift=shift)
+        self._reset_sample_timesteps()
+
+    def _reset_sample_timesteps(self):
+        # set_timesteps() also rewinds the scheduler's step index, so sample() can be called repeatedly.
+        sigmas = torch.linspace(1.0, 1 / self.sample_steps, self.sample_steps)
+        self.scheduler.set_timesteps(sigmas=sigmas, device='cuda')
+
     def get_call_vae_fn(self, vae):
         def fn(images):
             images = images.to('cuda', self.dtype)
@@ -294,20 +330,30 @@ class CommonPipeline:
         #         nn.init.zeros_(p)
 
     @torch.no_grad()
-    def sample(self, w=512, h=512):
-        x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
+    def sample(self, w=512, h=512, conds=None, unconds=None, cfg=None, generator=None, show_progress=True):
+        # conds / unconds / cfg default to what prepare_sample_test() stored; training previews pass their own,
+        # plus a seeded generator so the same prompt starts from the same noise at every save.
+        cfg = self.sample_cfg if cfg is None else cfg
+        conds = self.conds if conds is None else conds
+        if cfg > 1:
+            unconds = self.unconds if unconds is None else unconds
+        self._reset_sample_timesteps()
+        x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda', generator=generator)
         if self.is_video_vae:
             x = x.unsqueeze(2)
+        conds = tuple(tensor.to(x.device) for tensor in conds)
+        if cfg > 1:
+            unconds = tuple(tensor.to(x.device) for tensor in unconds)
         timesteps = self.scheduler.timesteps
-        for i, step in enumerate(tqdm(timesteps, desc='Sampling')):
+        for i, step in enumerate(tqdm(timesteps, desc='Sampling', disable=not show_progress)):
             t = step / 1000
             t = t.float().view(1)
-            inputs = (x, t, *self.conds)
+            inputs = (x, t, *conds)
             v = self.pipeline_model(inputs).float()
-            if self.sample_cfg > 1:
-                inputs_uncond = (x, t, *self.unconds)
+            if cfg > 1:
+                inputs_uncond = (x, t, *unconds)
                 v_uncond = self.pipeline_model(inputs_uncond).float()
-                v = v_uncond + self.sample_cfg*(v - v_uncond)
+                v = v_uncond + cfg*(v - v_uncond)
             x = self.scheduler.step(v, step, x, return_dict=False)[0]
         vae = self.get_vae()
         if isinstance(vae, nn.Module):

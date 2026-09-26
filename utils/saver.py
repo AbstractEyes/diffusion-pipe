@@ -45,7 +45,7 @@ def need_to_checkpoint(config, epoch=None):
 
 
 class Saver:
-    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model):
+    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model, previews=None):
         self.args = args
         self.config = config
         self.is_adapter = is_adapter
@@ -54,6 +54,8 @@ class Saver:
         self.train_dataloader = train_dataloader
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
+        # optional utils.previews.PreviewRenderer: renders the [samples] prompts after every save
+        self.previews = previews
 
     def save_adapter(self, name):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
@@ -114,6 +116,8 @@ class Saver:
             self.save_adapter(name)
         else:
             self.save_full_model(name)
+        if self.previews is not None:
+            self.previews.render(name, self.model_engine.global_steps)
 
     def save_checkpoint(self, step, examples):
         self.model_engine.save_checkpoint(

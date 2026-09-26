@@ -26,6 +26,7 @@ from utils import dataset as dataset_util
 from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
+import utils.previews
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
@@ -284,6 +285,8 @@ if __name__ == '__main__':
         config = json.loads(json.dumps(toml.load(f)))
 
     set_config_defaults(config)
+    # Optional [samples] table: preview images rendered at every save (utils/previews.py). Validated up front.
+    sample_settings = utils.previews.parse_samples_config(config)
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
@@ -391,6 +394,9 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
+    if sample_settings is not None:
+        utils.previews.check_supported(model, config)
+
     # import sys, PIL
     # test_image = sys.argv[1]
     # with torch.no_grad():
@@ -463,7 +469,9 @@ if __name__ == '__main__':
                 "bf16_master_weights = true is implemented for [optimizer] "
                 "type = 'adam' only (MasterWeightsAdam)")
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
+    # Previews need the text encoders (to encode their prompts after caching) and the VAE (to decode at every
+    # save), so keep them on the CPU instead of freeing them.
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample or sample_settings is not None)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)
@@ -554,6 +562,17 @@ if __name__ == '__main__':
 
     if args.test_sample:
         model.prepare_sample_test('a golden retriever running through a grassy field', cfg=5)
+
+    sample_conds = None
+    if sample_settings is not None:
+        sample_conds = utils.previews.encode_prompts(model, sample_settings)
+        if not args.test_sample:
+            # The training embeddings are cached; free the text encoders now, as a run without previews does.
+            for te in model.get_text_encoders():
+                if isinstance(te, nn.Module):
+                    te.to('meta')
+        if is_main_process():
+            print(f'[samples] {len(sample_conds)} preview prompts encoded; previews render at every save')
 
     model.load_diffusion_model()
 
@@ -953,11 +972,22 @@ if __name__ == '__main__':
 
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
-    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
+    previews = None
+    if sample_settings is not None:
+        previews = utils.previews.PreviewRenderer(
+            model, sample_settings, sample_conds, run_dir, tb_writer=tb_writer,
+            rank=model_engine.grid.get_data_parallel_rank(),
+            world=model_engine.grid.get_data_parallel_world_size(),
+            barrier=dist.barrier,
+            disable_block_swap=config.get('disable_block_swap_for_eval', False),
+        )
+    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model, previews=previews)
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
+    if previews is not None and sample_settings['before_first_step'] and not resume_from_checkpoint:
+        previews.render('step0', 0)
 
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
     epoch_loss = 0

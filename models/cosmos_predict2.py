@@ -182,6 +182,8 @@ class CosmosPredict2Pipeline(BasePipeline):
         'Block',
         'TransformerBlock',  # LLM adapter
     ]
+    # sampling (training previews, --test_sample): the latents are (B, C, T, H, W)
+    is_video_vae = True
 
     def __init__(self, config):
         self.config = config
@@ -388,6 +390,16 @@ class CosmosPredict2Pipeline(BasePipeline):
             latents = vae_encode(tensor, self.vae)
             return {'latents': latents}
         return fn
+
+    def get_conds(self, inputs):
+        # The text half of the pipeline inputs, in the order InitialLayer unpacks them after (x, t).
+        return (inputs['prompt_embeds'], inputs['attn_mask'], inputs['t5_input_ids'], inputs['t5_attn_mask'])
+
+    def vae_decode(self, latents):
+        # (B, C, T, H, W) latents -> (B, T, H, W, C) pixels in [0, 1], the layout sample() expects.
+        p = next(self.vae.model.parameters())
+        video = self.vae.model.decode(latents.to(p.device, p.dtype), self.vae.scale)
+        return ((video.float().clamp(-1, 1) + 1) / 2).movedim(1, -1)
 
     def get_call_text_encoder_fn(self, text_encoder):
         def fn(captions, is_video):
