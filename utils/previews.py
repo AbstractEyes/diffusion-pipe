@@ -153,9 +153,14 @@ class PreviewRenderer:
         s = self.settings
         written = []
         swap_prepared = False
+        # sample in eval mode (dropout off); the training mode is restored afterwards
+        pm = getattr(self.model, 'pipeline_model', None)
+        was_training = bool(getattr(pm, 'training', False))
         try:
             self.model.prepare_block_swap_inference(disable_block_swap=self.disable_block_swap)
             swap_prepared = True
+            if pm is not None:
+                pm.eval()
             self.model.set_sample_schedule(s['steps'], s['shift'])
             with torch.no_grad(), isolate_rng(include_cuda=self.device != 'cpu'):
                 for i in assign_prompts(len(s['prompts']), self.rank, self.world):
@@ -172,6 +177,8 @@ class PreviewRenderer:
         except Exception:
             print(f'[samples] {name}: rendering failed on rank {self.rank}, skipped:\n{traceback.format_exc()}')
         finally:
+            if pm is not None and was_training:
+                pm.train()
             if swap_prepared:
                 try:
                     self.model.prepare_block_swap_training()

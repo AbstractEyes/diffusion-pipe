@@ -217,6 +217,28 @@ def test_failures_never_raise():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_eval_mode_during_sampling_then_restored():
+    tmp = tempfile.mkdtemp(prefix='previews_mode_')
+    try:
+        m = FakeModel()
+        m.pipeline_model = torch.nn.Dropout(0.5)       # stands in for the pipeline module
+        modes = []
+        orig = m.sample
+        def spy(*a, **k):
+            modes.append(m.pipeline_model.training)
+            return orig(*a, **k)
+        m.sample = spy
+        r = pv.PreviewRenderer(m, _settings(width=32, height=32), _conds(4), tmp, None, device='cpu')
+        r.render('epoch1', 1)
+        assert modes == [False] * 4 and m.pipeline_model.training is True
+        m.pipeline_model.eval()                           # a model that was already in eval mode stays there
+        r.render('epoch2', 2)
+        assert m.pipeline_model.training is False
+        print('test_eval_mode_during_sampling_then_restored OK')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_encode_prompts():
     s = _settings(cfg=1.0)
     out = pv.encode_prompts(FakeModel(), s)
@@ -235,5 +257,6 @@ if __name__ == '__main__':
     test_render_two_ranks_and_tensorboard()
     test_same_seed_same_image_across_saves()
     test_failures_never_raise()
+    test_eval_mode_during_sampling_then_restored()
     test_encode_prompts()
     print('ALL previews tests passed')
