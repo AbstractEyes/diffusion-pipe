@@ -109,7 +109,10 @@ class SanaPipeline(BasePipeline):
             ti = self.tokenizer([prefix + captions[i] for i in rows], padding='max_length', max_length=max_length,
                                 truncation=True, add_special_tokens=True, return_tensors='pt')
             mask = ti.attention_mask.to(device)
-            e = text_encoder(ti.input_ids.to(device), attention_mask=mask)[0]
+            # The text encoder runs in its own dtype, as in the diffusers pipeline. The caption cache is computed without autocast,
+            # but training previews encode under the trainer's autocast (models/base.py), which would change the rounding.
+            with torch.autocast('cuda', enabled=False):
+                e = text_encoder(ti.input_ids.to(device), attention_mask=mask)[0]
             for j, i in enumerate(rows):
                 embeds[i] = e[j:j + 1, select]
                 masks[i] = mask[j:j + 1, select]
@@ -200,7 +203,8 @@ class InitialLayer(nn.Module):
         # the diffusers model takes the timestep on the 0-1,000 scale (the pipeline passes sigma x 1,000 x timestep_scale)
         ts = t.view(-1) * 1000 * getattr(self.model[0].config, 'timestep_scale', 1.0)
         timestep, embedded_timestep = self.time_embed(ts, batch_size=bs, hidden_dtype=hidden_states.dtype)
-        encoder_hidden_states = self.caption_projection(prompt_embeds)
+        # the text embeddings come from the bf16 text encoder (or the cache); the diffusers pipeline casts them to the transformer's dtype
+        encoder_hidden_states = self.caption_projection(prompt_embeds.to(hidden_states.dtype))
         encoder_hidden_states = encoder_hidden_states.view(bs, -1, hidden_states.shape[-1])
         encoder_hidden_states = self.caption_norm(encoder_hidden_states)
         # the encoder mask as an additive bias with a singleton query dimension, as the diffusers forward does
