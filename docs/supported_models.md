@@ -27,6 +27,7 @@
 |LTX 2.3         |✅    |❌              |✅                |
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
+|Sana            |✅    |✅              |❌                |
 
 
 ## SDXL
@@ -630,3 +631,25 @@ diffusion_model_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
 ```
 This configuration can train a rank 32 LoRA at 512 resolution with 24GB VRAM.
+
+## Sana
+```
+[model]
+type = 'sana'
+diffusers_path = '/data2/imagegen_models/Sana_600M_512px_diffusers'
+dtype = 'bfloat16'
+shift = 3.0
+```
+
+Use a diffusers-format Sana checkpoint, e.g. [Efficient-Large-Model/Sana_600M_512px_diffusers](https://huggingface.co/Efficient-Large-Model/Sana_600M_512px_diffusers) (the folder holds the transformer, the DC-AE autoencoder, the Gemma-2-2B-IT text encoder and the tokenizer). The plain weight files are loaded; the repos' fp16/bf16/int4 duplicates are not needed.
+
+Notes:
+- Captions are encoded the way the diffusers `SanaPipeline` encodes prompts: lowercased, its default complex human instruction prepended, the first token plus the last 299 kept (`max_sequence_length` = 300). An empty caption is encoded as the pipeline's unconditional prompt, so caption dropout and guidance see the same null conditioning. Set `use_complex_human_instruction = false` to skip the prefix.
+- The autoencoder and the text encoder run in bf16 (as on the model card); the text encoder runs with autocast off, so training previews condition on exactly the text the cache holds.
+- Train at the checkpoint's native resolution (512 for the 512px models, 1024 for the 1024px ones); image sides are rounded to multiples of 32.
+- `shift = 3.0` matches the checkpoints' own sampling shift (`flow_shift` in `scheduler/scheduler_config.json`).
+- LoRA targets every Linear layer in the transformer blocks (the self- and cross-attention projections; the feed-forward is convolutional).
+- Checked against the diffusers pipeline on Sana_600M_512px: identical text embeddings on matched batches, the layer chain identical to the diffusers forward up to fp32 rounding, and a training preview matching the pipeline's image on the same scheduler and noise. LoRA training itself has not yet been run end to end.
+- Licences: the Sana diffusers checkpoints are Apache-2.0; Gemma-2-2B-IT is under Google's Gemma Terms of Use.
+
+Sana LoRAs are saved in diffusers format: `pipe.load_lora_weights('<run>/epochN', weight_name='adapter_model.safetensors')`.
