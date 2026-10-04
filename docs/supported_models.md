@@ -649,7 +649,7 @@ Notes:
 - Train at the checkpoint's native resolution (512 for the 512px models, 1024 for the 1024px ones); image sides are rounded to multiples of 32.
 - `shift = 3.0` matches the checkpoints' own sampling shift (`flow_shift` in `scheduler/scheduler_config.json`).
 - LoRA targets every Linear layer in the transformer blocks (the self- and cross-attention projections; the feed-forward is convolutional).
-- Checked against the diffusers pipeline on Sana_600M_512px: identical text embeddings on matched batches, the layer chain identical to the diffusers forward up to fp32 rounding, and a training preview matching the pipeline's image on the same scheduler and noise. LoRA training itself has not yet been run end to end.
+- Checked against the diffusers pipeline on Sana_600M_512px: identical text embeddings on matched batches, the layer chain identical to the diffusers forward up to fp32 rounding, and a training preview matching the pipeline's image on the same scheduler and noise. LoRA training has since run end to end (rank-32 LoRAs on an RTX PRO 6000, each loaded back through diffusers and evaluated).
 - Licences: the Sana diffusers checkpoints are Apache-2.0; Gemma-2-2B-IT is under Google's Gemma Terms of Use.
 
 Sana LoRAs are saved in diffusers format: `pipe.load_lora_weights('<run>/epochN', weight_name='adapter_model.safetensors')`.
