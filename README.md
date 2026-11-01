@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, Sana (this fork).
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2, Sana (this fork), Qwen-Image-2.1 (T2I).
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -27,6 +27,10 @@ paths require `[optimizer] type = 'adam'` with `weight_decay = 0`
 (enforced). Research record: [geolip-aleph-diffusion](https://huggingface.co/AbstractPhil/geolip-aleph-diffusion).
 
 ## Recent changes
+- 2026-10-31
+  - Support Qwen-Image-2.1, text-to-image only (the model wrapper ported from upstream diffusion-pipe). See [the Qwen-Image-2.1 section](docs/supported_models.md#qwen-image-21).
+  - The ComfyUI submodule moved to v0.43.0. Run `git submodule update --init submodules/ComfyUI` after pulling.
+  - `exclude_modules` in the `[adapter]` config removes modules from the LoRA targets (e.g. attention-only LoRAs).
 - 2026-06-26
   - Train directly from parquet / HuggingFace datasets, and optionally store the latent/text-embedding cache as HF-uploadable multi-column parquet shards. Opt-in and model-agnostic; the legacy folder dataset and binary cache are unchanged. See the [Parquet / HuggingFace datasets](#parquet--huggingface-datasets-and-the-parquet-cache-backend) section.
 - 2026-06-24

@@ -28,6 +28,7 @@
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
 |Sana            |✅    |✅              |❌                |
+|Qwen-Image-2.1  |✅    |✅              |❌                |
 
 
 ## SDXL
@@ -653,3 +654,32 @@ Notes:
 - Licences: the Sana diffusers checkpoints are Apache-2.0; Gemma-2-2B-IT is under Google's Gemma Terms of Use.
 
 Sana LoRAs are saved in diffusers format: `pipe.load_lora_weights('<run>/epochN', weight_name='adapter_model.safetensors')`.
+
+## Qwen-Image-2.1
+```
+[model]
+type = 'qwen_image21'
+diffusion_model = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_bf16.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_vae_bf16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_8b_int8_convrot.safetensors', type = 'qwen_image'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+#merge_adapters = ['/path/to/training_adapter.safetensors']  # merges adapters into weights before training starts
+```
+
+Text-to-image only. The model wrapper is upstream diffusion-pipe's `models/qwen_image21.py` with one change: the target image's rope position comes from each caption's own length instead of the padded batch length, so a caption padded in a batch (or in its caching batch) is trained the way it runs at inference, unpadded. Everything is ComfyUI format: the split files from [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1) (`diffusion_models/`, `vae/`, `text_encoders/`), and the saved LoRAs (`diffusion_model.` prefix, loadable by ComfyUI's LoRA loaders). See [the example TOML](../examples/qwen_image21_lora.toml) and [its dataset TOML](../examples/qwen_image21_parquet_dataset.toml).
+
+Notes:
+- Needs the ComfyUI submodule at v0.43.0 or newer (`git submodule update --init submodules/ComfyUI`); older trees have no `comfy/ldm/qwen_image21`.
+- Train on the bf16 DiT (`qwen_image_2.1_bf16.safetensors`). The int8 convrot DiT that the ComfyUI templates load for inference is untested for training here: this fork dequantizes quantized checkpoints at load (it does not have upstream's LoRA-on-quantized-weights path), and whether the rotated int8 layout dequantizes back to the original weights has not been checked.
+- The text encoder is Qwen3-VL-8B with `type = 'qwen_image'`. It only runs while caching, inside ComfyUI, so the int8 convrot file works and gives the same embeddings ComfyUI computes at inference.
+- The VAE takes RGBA. Training pictures are RGB and get an opaque alpha channel before encoding (the VAE's own `pad_channel_value`).
+- I2I edit training is not supported: 2.1's text encoder reads the reference pictures together with the instruction, so the text embeddings cannot be cached from the caption alone.
+- Qwen-Image-2.1 is CFG-distilled: the published workflows sample the base at cfg 1. Plain flow-matching training pulls the conditional output toward the unguided velocity, so the more a LoRA trains, the more it needs real CFG (and a negative prompt) at inference. A training adapter merged with `merge_adapters` avoids this; none is published for 2.1 as of this writing.
+- LoRA targets every Linear inside the transformer blocks: attention q / k / v / out and the fused feed-forward (`img_mlp.gate_up`, `img_mlp.out`). The shared modulation, the input projections and the output layer sit outside the blocks and are not trained by a LoRA. For an attention-only LoRA add `exclude_modules = ['img_mlp.gate_up', 'img_mlp.out']` to `[adapter]`.
+- The fork's examples use pure Adam: `[optimizer] type = 'adam'` with `weight_decay = 0`.
+- The subject-bucketing manifest and the parquet cache work as for any other model; the 2.1 cache is written under its own model name (`qwen_image21`), next to other models' caches of the same rows.
+- Checks: `python test/test_qwen_image21.py` runs on a CPU without model files (the training layer chain against ComfyUI's own forward on a small random model, padding, LoRA targets, the VAE and caption handling). `python tools/qwen_image21_parity.py` repeats the comparison on a CUDA card with the real weights, text encoder and VAE included.
+- Licence: the weights are under the Qwen Research License (research and evaluation; commercial use needs a licence from Qwen; derivatives display "Built with Qwen").

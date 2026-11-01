@@ -1,0 +1,49 @@
+# Qwen-Image-2.1 text-to-image LoRA (models/qwen_image21.py; docs/supported_models.md, "Qwen-Image-2.1").
+# One GPU (pipeline_stages = 1). Model files: the ComfyUI split files from Comfy-Org/Qwen-Image-2.1
+# (diffusion_models/, vae/, text_encoders/); set the absolute paths where they were downloaded.
+# The weights are under the Qwen Research License (research and evaluation only).
+
+output_dir = '/content/runs/qwen_image21_lora'
+dataset = 'examples/qwen_image21_parquet_dataset.toml'
+
+epochs = 4
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+warmup_steps = 100
+save_every_n_epochs = 1
+checkpoint_every_n_minutes = 60
+activation_checkpointing = true
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 10
+
+[model]
+type = 'qwen_image21'
+diffusion_model = '/content/models/qwen_image_2.1/diffusion_models/qwen_image_2.1_bf16.safetensors'
+vae = '/content/models/qwen_image_2.1/vae/qwen_image_2.1_vae_bf16.safetensors'
+text_encoders = [
+    {path = '/content/models/qwen_image_2.1/text_encoders/qwen3vl_8b_int8_convrot.safetensors', type = 'qwen_image'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+# The model is CFG-distilled; a training adapter merged here keeps the distillation (none is published for 2.1 yet).
+#merge_adapters = ['/path/to/training_adapter.safetensors']
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+# Attention-only LoRA (leaves the feed-forward of every block untouched):
+#exclude_modules = ['img_mlp.gate_up', 'img_mlp.out']
+
+[optimizer]
+type = 'adam'          # pure Adam; no decoupled weight decay
+lr = 1e-4
+betas = [0.9, 0.99]
+eps = 1e-8
+weight_decay = 0.0
+
+[monitoring]
+enable_wandb = false
