@@ -46,6 +46,13 @@ def unpack_segments(endpoints, masks):
     return segments
 
 
+def split_uncond(inputs):
+    # Layer inputs: the conditional tuple (14 tensors + one mask per segment; endpoints at index 13), then, when
+    # training with cfg > 1, the unconditional branch: (hidden_states, pe, sizes, endpoints, *masks).
+    n = 14 + inputs[13].shape[0]
+    return inputs[:n], tuple(inputs[n:])
+
+
 class QwenImage21Pipeline(ComfyPipeline):
     name = 'qwen_image21'
     spatial_compression = 16
@@ -59,6 +66,14 @@ class QwenImage21Pipeline(ComfyPipeline):
         self.latent_format = comfy.latent_formats.QwenImage21()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
+        # Distillation-preserving training (the CFG-augmented training upstream added for MiniMax H3): the model's
+        # output is read as already guided at strength cfg, and the loss is taken on the implied unguided velocity
+        # (out + (cfg - 1) * out_uncond) / cfg, the unconditional branch (empty caption) run without gradient.
+        self.cfg = self.model_config.get('cfg', 1.0)
+        if self.cfg > 1:
+            # Because the uncond branch is no_grad, but tensors passed between pipeline parallel stages must require grad.
+            assert self.config['pipeline_stages'] == 1, 'cfg training requires pipeline_stages=1'
+
     def to_layers(self):
         diffusion_model = self.diffusion_model
         transformer_options = {
@@ -68,7 +83,7 @@ class QwenImage21Pipeline(ComfyPipeline):
         layers = [InitialLayer(diffusion_model)]
         for i, block in enumerate(diffusion_model.transformer_blocks):
             layers.append(TransformerLayer(block, i, transformer_options, self.offloader))
-        layers.append(FinalLayer(diffusion_model))
+        layers.append(FinalLayer(diffusion_model, self.cfg))
         return layers
 
     def get_conds(self, inputs):
@@ -127,7 +142,17 @@ class QwenImage21Pipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = noise - latents
 
-        return (noisy_latents, t, *self.get_conds(inputs)), (target, mask)
+        if self.cfg > 1:
+            # the cached empty-caption embedding (set by the dataset code after caching), one copy per row
+            uncond = {}
+            for k in ('text_embeds_0', 'attention_mask_0'):
+                v = self.uncond_dict[k]
+                uncond[k] = v.unsqueeze(0).repeat(bs, *([1]*v.ndim))
+            unconds = self.get_conds(uncond)
+        else:
+            unconds = tuple()
+
+        return (noisy_latents, t, *self.get_conds(inputs), *unconds), (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model
@@ -218,7 +243,7 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        x, timesteps, context, context_mask = inputs
+        x, timesteps, context, context_mask, *uncond = inputs
 
         B, C, H, W = x.shape
         dtype = x.dtype
@@ -241,7 +266,16 @@ class InitialLayer(nn.Module):
 
         endpoints, masks = pack_segments(segments)
 
-        return make_contiguous(hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks)
+        outputs = make_contiguous(hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks)
+        if uncond:
+            # cfg training: the unconditional branch (empty caption) through the same layers, without gradient
+            context_uncond, context_mask_uncond = uncond
+            with torch.no_grad():
+                hidden_states_uncond, pe_uncond, segments_uncond = self.build_sequence(x, context_uncond, context_mask_uncond, ref_latents, image_slots)
+            sizes_uncond = torch.tensor([hidden_states_uncond.shape[1], H, W])
+            endpoints_uncond, masks_uncond = pack_segments(segments_uncond)
+            outputs += make_contiguous(hidden_states_uncond, pe_uncond, sizes_uncond, endpoints_uncond, *masks_uncond)
+        return outputs
 
 
 class TransformerLayer(nn.Module):
@@ -255,6 +289,7 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
+        inputs, uncond = split_uncond(inputs)
         hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks = inputs
         mod = ((mod_scale1_a, mod_scale1_b), (mod_gate1_a, mod_gate1_b), (mod_scale2_a, mod_scale2_b), (mod_gate2_a, mod_gate2_b), mod_zeros)
         seq_len, H, W = sizes
@@ -265,28 +300,47 @@ class TransformerLayer(nn.Module):
 
         self.offloader.wait_for_block(self.block_idx)
         hidden_states = self.layer(hidden_states, mod, pe, attn_fn, prefix_len, self.transformer_options)
+        if uncond:
+            hidden_states_uncond, pe_uncond, sizes_uncond, endpoints_uncond, *masks_uncond = uncond
+            prefix_len_uncond = sizes_uncond[0] - H*W
+            attn_fn_uncond = block_causal_attention(unpack_segments(endpoints_uncond, masks_uncond), self.transformer_options, None, self.block_idx, prefix_len_uncond)
+            with torch.no_grad():
+                hidden_states_uncond = self.layer(hidden_states_uncond, mod, pe_uncond, attn_fn_uncond, prefix_len_uncond, self.transformer_options)
+            uncond = (hidden_states_uncond, pe_uncond, sizes_uncond, endpoints_uncond, *masks_uncond)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks)
+        return make_contiguous(hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks, *uncond)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, cfg=1.0):
         super().__init__()
         self.norm_out = model.norm_out
         self.proj_out = model.proj_out
         self.model = [model]
+        self.cfg = cfg
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
-    @torch.compiler.disable
-    def forward(self, inputs):
-        hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks = inputs
-        seq_len, H, W = sizes
-        prefix_len = seq_len - H*W
+    def project(self, hidden_states, temb, prefix_len, H, W):
         B = hidden_states.shape[0]
         hidden_states = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])
         hidden_states = self.proj_out(hidden_states)
         return hidden_states.transpose(1, 2).reshape(B, self.out_channels, H, W)
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.compiler.disable
+    def forward(self, inputs):
+        inputs, uncond = split_uncond(inputs)
+        hidden_states, temb, pe, mod_scale1_a, mod_scale1_b, mod_gate1_a, mod_gate1_b, mod_scale2_a, mod_scale2_b, mod_gate2_a, mod_gate2_b, mod_zeros, sizes, endpoints, *masks = inputs
+        seq_len, H, W = sizes
+        out = self.project(hidden_states, temb, seq_len - H*W, H, W)
+        if uncond:
+            assert self.cfg > 1
+            hidden_states_uncond, pe_uncond, sizes_uncond, endpoints_uncond, *masks_uncond = uncond
+            with torch.no_grad():
+                out_uncond = self.project(hidden_states_uncond, temb, sizes_uncond[0] - H*W, H, W)
+            # "raw" velocity from the guidance-distilled output and its own uncond (the CFG equation rearranged)
+            out = (out + (self.cfg - 1) * out_uncond) / self.cfg
+        return out

@@ -121,8 +121,8 @@ def _inputs(batch=2, txt_len=7, h=6, w=5, dtype=torch.float32, seed=1):
     return x, t, context, mask
 
 
-def _chain(pipe, x, t, context, mask):
-    h = (x, t, context, mask)
+def _chain(pipe, *inputs):
+    h = inputs
     for layer in pipe.to_layers():
         h = layer(h)
     return h
@@ -235,6 +235,51 @@ def test_lora_targets_and_gradients():
     print(f'test_lora_targets_and_gradients OK ({len(expected)} targets; {len(targets)} with the feed-forward excluded)')
 
 
+def test_cfg_training():
+    # cfg = w: the output fed to the loss is (out + (w - 1) * out_uncond) / w, the unconditional branch (empty
+    # caption) run through the same layers without gradient; without the uncond inputs (sampling) the output is plain.
+    w = 4.0
+    with torch.no_grad():
+        model = _tiny_model(dtype=torch.float64)
+        x, t, context, mask = _inputs(batch=2, txt_len=9, dtype=torch.float64)
+        g = torch.Generator().manual_seed(3)
+        uncond = torch.randn(2, 3, 24, generator=g, dtype=torch.float64)
+        uncond_mask = torch.ones(2, 3, dtype=torch.bool)
+        pipe = _pipeline(cfg=w)
+        pipe.diffusion_model = model
+        out = _chain(pipe, x, t, context, mask, uncond, uncond_mask)
+        expected = (_reference(model, x, t, context) + (w - 1) * _reference(model, x, t, uncond)) / w
+        rel = _rel(out, expected)
+        plain = _rel(_chain(pipe, x, t, context, mask), _reference(model, x, t, context))
+    print(f'  cfg {w:g} chain vs (forward + {w - 1:g} * uncond forward) / {w:g}, fp64: {rel:.2e}; sampling path: {plain:.2e}')
+    assert rel < 1e-12 and plain < 1e-12, (rel, plain)
+
+    # the uncond branch carries no gradient: every LoRA gradient is exactly 1/w of the plain chain's
+    adapter = {'type': 'lora', 'rank': 4, 'alpha': 4, 'dropout': 0.0, 'dtype': torch.float64}
+    pipe_plain = _pipeline()
+    pipe_plain.diffusion_model = model
+    pipe_plain.configure_adapter(adapter)
+    pipe.diffusion_model = model
+    params = [p for n, p in model.named_parameters() if 'lora_' in n]
+    weights = torch.randn(x.shape, generator=g, dtype=torch.float64)
+    grads_plain = torch.autograd.grad((_chain(pipe_plain, x, t, context, mask) * weights).sum(), params)
+    grads_cfg = torch.autograd.grad((_chain(pipe, x, t, context, mask, uncond, uncond_mask) * weights).sum(), params)
+    worst = max(_rel(gc * w, gp) for gc, gp in zip(grads_cfg, grads_plain) if gp.abs().max() > 0)
+    print(f'  LoRA gradients, cfg chain x {w:g} vs plain chain: worst relative {worst:.2e}')
+    assert worst < 1e-10, worst
+
+    # prepare_inputs appends the cached empty-caption conds, one copy per row
+    pipe = _pipeline(cfg=w)
+    pipe.uncond_dict = {'text_embeds_0': torch.randn(3, 24), 'attention_mask_0': torch.ones(3, dtype=torch.int64)}
+    inputs = {'latents': torch.randn(2, 16, 6, 5), 'mask': None,
+              'text_embeds_0': [torch.randn(4, 24), torch.randn(9, 24)],
+              'attention_mask_0': [torch.ones(4, dtype=torch.int64), torch.ones(9, dtype=torch.int64)]}
+    features, _ = pipe.prepare_inputs(inputs)
+    assert len(features) == 6 and features[4].shape == (2, 3, 24) and features[5].dtype == torch.bool
+    assert torch.equal(features[4][0], pipe.uncond_dict['text_embeds_0'])
+    print('test_cfg_training OK')
+
+
 class _FakeVAE:
     def __init__(self, sd=None):
         self.crop_input = True
@@ -312,6 +357,7 @@ ALL_TESTS = [
     test_padded_row_matches_unpadded,
     test_prepare_inputs_variable_length_text,
     test_lora_targets_and_gradients,
+    test_cfg_training,
     test_vae_rgba_padding,
     test_text_encoder_batching,
 ]

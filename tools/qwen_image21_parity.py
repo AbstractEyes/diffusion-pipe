@@ -9,7 +9,8 @@ run, and nothing is written to disk. The checks:
                 bf16 autocast; beside the run-to-run spread, the inference-dtype forward, and (on cards with at least
                 48 GB) the bf16-vs-fp32 spread of the forward itself
   padding       the shorter caption's row in a padded batch against the same row alone
-  lora step     one checkpointed forward/backward at 512 px with a rank-4 LoRA: finite loss, every LoRA gets a gradient
+  lora step     one checkpointed forward/backward at 512 px with a rank-4 LoRA: finite loss, every LoRA gets a gradient;
+                then the same step with cfg = 4 (the distillation-preserving loss, empty caption as the uncond)
 
 Run it from the repository (python tools/qwen_image21_parity.py) or paste the whole file into one notebook cell.
 Set the paths below (or the DIFFUSION_PIPE_DIR / QWEN_IMAGE21_DIR environment variables). Memory: the transformer in
@@ -171,9 +172,10 @@ def check_text_encoder():
     out, ms = timed(lambda: fn(CAPTIONS, is_video=[False] * len(CAPTIONS)))
     emb_b, mask_b = out['text_embeds_0'].cpu(), out['attention_mask_0'].cpu()
     alone = []
-    for caption in CAPTIONS:
+    for caption in CAPTIONS + ['']:
         o = te.encode_from_tokens_scheduled(te.tokenize(caption))
         alone.append(o[0][0][0].to(torch.bfloat16).cpu())  # (L, 4096); one caption has no padding
+    state['emb_empty'] = alone.pop()  # the empty caption, the unconditional branch of cfg training
     lengths = [a.shape[0] for a in alone]
     ok = mask_b.sum(dim=1).tolist() == lengths and emb_b.shape[1] == max(lengths)
     worst_rel = max(rel(emb_b[i, :lengths[i]], alone[i]) for i in range(len(CAPTIONS)))
@@ -271,29 +273,37 @@ def check_padding():
 def check_lora_step():
     pipe.configure_adapter({'type': 'lora', 'rank': 4, 'alpha': 4, 'dropout': 0.0, 'dtype': torch.bfloat16})
     model = pipe.diffusion_model.train()
-    layers = pipe.to_layers()
     inputs = {
         'latents': state['latents_512'],
         'mask': None,
         'text_embeds_0': [state['emb_alone'][1]],
         'attention_mask_0': [torch.ones(state['emb_alone'][1].shape[0], dtype=torch.int64)],
     }
-    features, (target, _) = pipe.prepare_inputs(inputs, timestep_quantile=0.5)
-    features = tuple(f.cuda() for f in features)
-    torch.cuda.reset_peak_memory_stats()
-    with torch.enable_grad():
-        def step():
-            out = chain(layers, features, checkpoint=True)
-            loss = pipe.get_loss_fn()(out, (target.cuda(), torch.tensor([])))
-            loss.backward()
-            return loss
-        loss, ms = timed(step)
     lora_b = [(n, p) for n, p in model.named_parameters() if 'lora_B' in n]
-    with_grad = sum(1 for _, p in lora_b if p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
-    ok = torch.isfinite(loss).item() and with_grad == len(lora_b) == 6 * len(model.transformer_blocks)
-    record('lora step', 'PASS' if ok else 'FAIL',
-           f'loss {loss.item():.4f}; {with_grad} of {len(lora_b)} LoRA modules got a finite non-zero gradient; '
-           f'forward+backward at 512px {ms:.0f} ms, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB')
+    for cfg in (1.0, 4.0):
+        # cfg 4: the distillation-preserving loss, with the empty caption as the unconditional branch
+        pipe.cfg = cfg
+        pipe.uncond_dict = {'text_embeds_0': state['emb_empty'],
+                            'attention_mask_0': torch.ones(state['emb_empty'].shape[0], dtype=torch.int64)}
+        layers = pipe.to_layers()
+        torch.manual_seed(SEED)
+        features, (target, _) = pipe.prepare_inputs(inputs, timestep_quantile=0.5)
+        features = tuple(f.cuda() for f in features)
+        model.zero_grad(set_to_none=True)
+        torch.cuda.reset_peak_memory_stats()
+        with torch.enable_grad():
+            def step():
+                out = chain(layers, features, checkpoint=True)
+                loss = pipe.get_loss_fn()(out, (target.cuda(), torch.tensor([])))
+                loss.backward()
+                return loss
+            loss, ms = timed(step)
+        with_grad = sum(1 for _, p in lora_b if p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
+        ok = torch.isfinite(loss).item() and with_grad == len(lora_b) == 6 * len(model.transformer_blocks)
+        record('lora step' if cfg == 1 else f'cfg {cfg:g} step', 'PASS' if ok else 'FAIL',
+               f'loss {loss.item():.4f}; {with_grad} of {len(lora_b)} LoRA modules got a finite non-zero gradient; '
+               f'forward+backward at 512px {ms:.0f} ms, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB')
+    pipe.cfg = 1.0
 
 
 run_check('text encoder', check_text_encoder)

@@ -28,7 +28,10 @@ text_encoders = [
 ]
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
-# The model is CFG-distilled; a training adapter merged here keeps the distillation (none is published for 2.1 yet).
+# The model is CFG-distilled. To keep the distillation, either train against the model's own guided output
+# (cfg = w; the guidance strength baked into 2.1 is unpublished, choose w by a short screen, e.g. 3, 4, 5)...
+#cfg = 4
+# ...or merge a training adapter before training (none is published for 2.1 yet).
 #merge_adapters = ['/path/to/training_adapter.safetensors']
 
 [adapter]
