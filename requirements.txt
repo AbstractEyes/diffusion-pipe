@@ -28,8 +28,13 @@ wandb
 optimum-quanto
 wheel
 ninja
-comfy-kitchen
-comfy-aimdo
+# the versions the ComfyUI submodule (v0.43.0) pins; its model loading imports version-specific parts of both
+comfy-kitchen==0.2.40
+comfy-aimdo==0.6.0
+# imported by the ComfyUI submodule's model loading and samplers
+torchsde
+psutil
+pyyaml
 scipy
 pyarrow
 huggingface_hub

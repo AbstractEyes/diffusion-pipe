@@ -9,7 +9,8 @@ deepspeed is stubbed when it cannot be imported (e.g. on Windows); nothing here 
 Covers: the model wrappers importing against the real ComfyUI tree; the training layer chain against
 ComfyUI's own QwenImage21 forward on a small random model (fp32 and fp64); a padded batch row against the
 same row alone; LoRA targeting (all block Linears, exclude_modules) and gradient flow into every LoRA;
-the RGBA channel padding of the VAE input; text-encoder batching with the 2.1 tokenizer's keep_vision key.
+the RGBA channel padding of the VAE input; text-encoder batching with the 2.1 tokenizer's keep_vision key; the
+training previews' sampling schedule against the one ComfyUI samples 2.1 with.
 """
 import importlib
 import importlib.machinery
@@ -351,6 +352,26 @@ def test_text_encoder_batching():
     print(f'test_text_encoder_batching OK (token lengths {lengths})')
 
 
+def test_preview_schedule_matches_comfy():
+    # Training previews sample with a flow-matching Euler schedule: `steps` sigmas from 1 down to 1 / steps, shifted as
+    # shift * s / (1 + (shift - 1) * s) (models/base.py set_sample_schedule). ComfyUI samples 2.1 with euler / simple on
+    # the model's own time shift mu (sampling_settings), exp(mu) / (exp(mu) + 1 / s - 1). The two agree when
+    # shift = exp(mu); checked here on the scheduler class the previews use.
+    import comfy.model_sampling
+    import comfy.samplers
+    import comfy.supported_models
+    mu = comfy.supported_models.QwenImage21.sampling_settings['shift']
+    model_sampling = comfy.model_sampling.ModelSamplingFlux(types.SimpleNamespace(sampling_settings={'shift': mu}))
+    ref = comfy.samplers.calculate_sigmas(model_sampling, 'simple', 25).float()
+    scheduler = base.FlowMatchEulerDiscreteScheduler(shift=math.exp(mu))
+    scheduler.set_timesteps(sigmas=torch.linspace(1.0, 1 / 25, 25), device='cpu')
+    ours = torch.as_tensor(scheduler.sigmas).float()
+    assert ours.shape == ref.shape, (ours.shape, ref.shape)
+    diff = (ours - ref).abs().max().item()
+    assert diff <= 1e-5, diff
+    print(f'test_preview_schedule_matches_comfy OK (mu {mu}, shift {math.exp(mu):.4f}, max sigma difference {diff:.1e})')
+
+
 ALL_TESTS = [
     test_imports,
     test_layer_chain_matches_comfy_forward,
@@ -360,6 +381,7 @@ ALL_TESTS = [
     test_cfg_training,
     test_vae_rgba_padding,
     test_text_encoder_batching,
+    test_preview_schedule_matches_comfy,
 ]
 
 if __name__ == '__main__':

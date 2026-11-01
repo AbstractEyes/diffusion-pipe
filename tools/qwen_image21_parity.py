@@ -9,19 +9,25 @@ run, and nothing is written to disk. The checks:
                 bf16 autocast; beside the run-to-run spread, the inference-dtype forward, and (on cards with at least
                 48 GB) the bf16-vs-fp32 spread of the forward itself
   padding       the shorter caption's row in a padded batch against the same row alone
+  preview sample  the training previews' sampling schedule against the one ComfyUI samples 2.1 with (euler, simple,
+                the model's own time shift), then one 512 px picture through the trainer's sample() and VAE decode:
+                finite and not flat
   lora step     one checkpointed forward/backward at 512 px with a rank-4 LoRA: finite loss, every LoRA gets a gradient;
                 then the same step with cfg = 4 (the distillation-preserving loss, empty caption as the uncond)
 
 Run it from the repository (python tools/qwen_image21_parity.py) or paste the whole file into one notebook cell.
 Set the paths below (or the DIFFUSION_PIPE_DIR / QWEN_IMAGE21_DIR environment variables). Memory: the transformer in
 bf16 (14.2 GB) plus activations; the text encoder and the VAE are unloaded before the transformer is loaded.
+QWEN_IMAGE21_SAMPLE_OUT names a file to keep the preview check's picture in (nothing else is written).
 """
 import gc
+import math
 import os
 import platform
 import sys
 import time
 import traceback
+import types
 
 REPO = os.environ.get('DIFFUSION_PIPE_DIR') or (
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in globals() else '/content/diffusion-pipe')
@@ -33,6 +39,8 @@ IMAGE = None         # path to a picture to encode; None = a synthetic picture
 RESOLUTION = 1024
 TIMESTEP = 0.6
 SEED = 0
+SAMPLE_STEPS = 25    # the step count of ComfyUI's 2.1 template, used by the training previews
+SAMPLE_OUT = os.environ.get('QWEN_IMAGE21_SAMPLE_OUT')   # where to save the preview check's picture; None = not saved
 CAPTIONS = [
     'a red fox',
     'a red fox asleep under an old oak tree in fresh snow, early morning light, shallow depth of field',
@@ -270,6 +278,39 @@ def check_padding():
            f'(cosine {cos(v_pad, v_alone):.6f}); same row in an unpadded batch of 2 vs alone {batch_rounding:.2e}')
 
 
+def check_preview_sample():
+    # The training previews' path: CommonPipeline.sample() (an Euler loop over the trainer's layer chain on a shifted
+    # flow-matching schedule), then the VAE decode. The schedule must be the one ComfyUI samples 2.1 with.
+    import comfy.model_sampling
+    import comfy.samplers
+    import comfy.supported_models
+    mu = comfy.supported_models.QwenImage21.sampling_settings['shift']
+    model_sampling = comfy.model_sampling.ModelSamplingFlux(types.SimpleNamespace(sampling_settings={'shift': mu}))
+    ref = comfy.samplers.calculate_sigmas(model_sampling, 'simple', SAMPLE_STEPS).float()
+    pipe.set_sample_schedule(SAMPLE_STEPS, math.exp(mu))
+    ours = torch.as_tensor(pipe.scheduler.sigmas).float().cpu()
+    ladder = float((ours - ref).abs().max()) if ours.shape == ref.shape else float('inf')
+    pipe.diffusion_model.eval()
+    layers = pipe.to_layers()
+    pipe.pipeline_model = lambda inputs: chain(layers, inputs)   # the trainer's pipeline module runs the same chain
+    emb = state['emb_alone'][0]
+    conds = pipe.get_conds({'text_embeds_0': [emb], 'attention_mask_0': [torch.ones(emb.shape[0], dtype=torch.int64)]})
+    gen = torch.Generator(device='cuda').manual_seed(SEED)
+    img, ms = timed(lambda: pipe.sample(w=512, h=512, conds=conds, cfg=1, generator=gen, show_progress=False))
+    img = img.float()
+    finite = bool(torch.isfinite(img).all())
+    spread = float(img[..., :3].std()) if finite else float('nan')
+    ok = ladder <= 1e-5 and finite and img.ndim == 4 and img.shape[-1] in (3, 4) and spread > 0.02
+    saved = ''
+    if SAMPLE_OUT and finite:
+        from PIL import Image
+        Image.fromarray((img[0, ..., :3].clamp(0, 1).cpu().numpy() * 255).round().astype('uint8')).save(SAMPLE_OUT)
+        saved = f'; saved to {SAMPLE_OUT}'
+    record('preview sample', 'PASS' if ok else 'FAIL',
+           f'schedule vs ComfyUI euler / simple at mu {mu} ({SAMPLE_STEPS} steps): max sigma difference {ladder:.1e}; '
+           f'"{CAPTIONS[0]}" at 512px {tuple(img.shape)} in {ms / 1000:.1f} s, pixel spread {spread:.3f}{saved}')
+
+
 def check_lora_step():
     pipe.configure_adapter({'type': 'lora', 'rank': 4, 'alpha': 4, 'dropout': 0.0, 'dtype': torch.bfloat16})
     model = pipe.diffusion_model.train()
@@ -309,7 +350,8 @@ def check_lora_step():
 run_check('text encoder', check_text_encoder)
 run_check('vae', check_vae)
 loaded = run_check('load', load_transformer)
-for name, fn in (('layer chain', check_layer_chain), ('padding', check_padding), ('lora step', check_lora_step)):
+for name, fn in (('layer chain', check_layer_chain), ('padding', check_padding), ('preview sample', check_preview_sample),
+                 ('lora step', check_lora_step)):
     needs = ('emb_alone', f'latents_{RESOLUTION}', 'latents_512')
     if not loaded or any(k not in state for k in needs):
         record(name, 'SKIP', 'an earlier step failed (see above)')
