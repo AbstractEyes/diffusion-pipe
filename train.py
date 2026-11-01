@@ -394,6 +394,9 @@ if __name__ == '__main__':
     elif model_type == 'sana':
         from models import sana
         model = sana.SanaPipeline(config)
+    elif model_type == 'qwen_image21':
+        from models import qwen_image21
+        model = qwen_image21.QwenImage21Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
