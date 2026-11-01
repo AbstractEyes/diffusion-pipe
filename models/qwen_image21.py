@@ -205,8 +205,12 @@ class InitialLayer(nn.Module):
             pos += max(h, w)
             length += h * w
 
-        # (1, N, 1, ...): the layout the fused rms_rope wants for (B, N, H, D) queries
-        pe = self.pe_embedder(torch.cat(ids, dim=0).unsqueeze(0)).transpose(1, 2).contiguous()
+        # Different from source. Captions in a batch are padded to the longest one, which would put the target image at
+        # the padded text length on the first rope axis. Put it at each row's own text length instead, as at inference
+        # where nothing is padded. (B, N, 1, ...): one rope table per row.
+        ids = torch.cat(ids, dim=0).unsqueeze(0).repeat(bs, 1, 1)
+        ids[:, txt_len:, 0] = context_mask.sum(dim=1, keepdim=True).to(ids.dtype)
+        pe = self.pe_embedder(ids).transpose(1, 2).contiguous()
         return torch.cat(parts, dim=1), pe, segments
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
