@@ -2,10 +2,14 @@
 # The parquet path is model-agnostic (see examples/anima_hf_parquet_dataset.toml for every option); the 2.1
 # cache is written under the model name 'qwen_image21', beside other models' caches of the same rows.
 #
+# Train 2.1 on photographs and other images that Qwen-Image did not generate. Renders from the 2025 Qwen-Image (for
+# example this dataset's qwen_90k config, which is Qwen-Image Lightning output) would pull the new model toward its
+# predecessor's look.
+#
 # Subject bucketing: write the repeat manifest once (offline, CPU, no model needed), then point the
 # directory at it with bucket_manifest + manifest_key_column:
-#   python -m utils.subject_bucket --dataset AbstractPhil/diffusion-pretrain-set-ft1 --config sdxl_qwen_phase0 \
-#       --caption-column caption_vlm_json --out manifest_qwen_90k.json
+#   python -m utils.subject_bucket --dataset AbstractPhil/diffusion-pretrain-set-ft1 --config big_liminal \
+#       --caption-column caption_vlm_json --out manifest_big_liminal.json
 # The manifest only sets each row's num_repeats (keyed by the row id). It is not part of the latents
 # fingerprint, so a new manifest re-orders the epoch without re-encoding anything. The defaults
 # (--alpha 0.5 --max-repeats 8) grew one 79k-row set about 4.3x per epoch; gentler settings (higher alpha,
@@ -28,7 +32,7 @@ parquet_shard_lru = 8
 [[directory]]
 type = 'huggingface'
 dataset = 'AbstractPhil/diffusion-pretrain-set-ft1'
-config = 'sdxl_qwen_phase0'              # the folder under data/ (the dataset viewer calls this config qwen_90k)
+config = 'big_liminal'                   # the folder under data/ (photographs of liminal interiors and architecture)
 split = 'train'
 image_column = 'image'
 width_column = 'image_width'
@@ -37,7 +41,7 @@ caption_column = 'caption_vlm_json'
 caption_type = 'text'                    # the JSON caption string, trained verbatim
 num_repeats = 1
 skip_empty_caption = true                # also skips the '' / '__PARSEFAIL__' placeholders
-bucket_manifest = 'manifest_qwen_90k.json'
+bucket_manifest = 'manifest_big_liminal.json'
 manifest_key_column = 'id'
 # Give every [[directory]] its own cache root (two directories on one root overwrite each other):
-# path = '/content/cache/qwen_90k'
+# path = '/content/cache/big_liminal'

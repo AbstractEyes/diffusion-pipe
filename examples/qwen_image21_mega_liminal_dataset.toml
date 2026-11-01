@@ -1,0 +1,74 @@
+# Qwen-Image-2.1 dataset config: AbstractPhil/mega-liminal, 1,873 captioned images in ten class folders (liminal spaces:
+# empty interiors, outdoor architecture, suburbs; mostly photographs). The dataset's card sets its terms: research and
+# non-commercial use, rights stay with the image creators.
+#
+# Download it once (public, no token needed):
+#   from huggingface_hub import snapshot_download
+#   snapshot_download('AbstractPhil/mega-liminal', repo_type='dataset', local_dir='/content/data/mega-liminal')
+#
+# One [[directory]] per class folder. num_repeats are dampened repeats (square-root damping, at most 8 per image), so the
+# small classes are seen often enough to count without being memorized: 2,789 samples per epoch. The captions read
+# 'liminal, <class>, <description>' and are trained as written (no caption shuffling).
+#
+# Train 2.1 on photographs and other images that Qwen-Image did not generate. Renders from the 2025 Qwen-Image (for
+# example the qwen_90k config of AbstractPhil/diffusion-pretrain-set-ft1, which is Qwen-Image Lightning output) would
+# pull the new model toward its predecessor's look.
+
+# 1 MP training resolution, multi-aspect buckets.
+resolutions = [1024]
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+frame_buckets = [1]
+shuffle_caption = false
+
+[[directory]]   # mega liminal: 870 images x 1 = 870 samples per epoch
+path = '/content/data/mega-liminal/data/mega_liminal'
+caption_extension = '.txt'
+num_repeats = 1
+
+[[directory]]   # landscape: 766 images x 1 = 766
+path = '/content/data/mega-liminal/data/landscape'
+caption_extension = '.txt'
+num_repeats = 1
+
+[[directory]]   # suburban: 111 images x 3 = 333
+path = '/content/data/mega-liminal/data/suburban'
+caption_extension = '.txt'
+num_repeats = 3
+
+[[directory]]   # simulacrum: 36 images x 5 = 180
+path = '/content/data/mega-liminal/data/simulacrum'
+caption_extension = '.txt'
+num_repeats = 5
+
+[[directory]]   # vanishing point: 21 images x 6 = 126
+path = '/content/data/mega-liminal/data/vanishing_point'
+caption_extension = '.txt'
+num_repeats = 6
+
+[[directory]]   # empty mall: 20 images x 7 = 140
+path = '/content/data/mega-liminal/data/empty_mall'
+caption_extension = '.txt'
+num_repeats = 7
+
+[[directory]]   # hand sourced: 18 images x 7 = 126
+path = '/content/data/mega-liminal/data/hand_sourced'
+caption_extension = '.txt'
+num_repeats = 7
+
+[[directory]]   # parking garage: 13 images x 8 = 104
+path = '/content/data/mega-liminal/data/parking_garage'
+caption_extension = '.txt'
+num_repeats = 8
+
+[[directory]]   # cityscape: 10 images x 8 = 80
+path = '/content/data/mega-liminal/data/cityscape'
+caption_extension = '.txt'
+num_repeats = 8
+
+[[directory]]   # movie theatre: 8 images x 8 = 64
+path = '/content/data/mega-liminal/data/movie_theatre'
+caption_extension = '.txt'
+num_repeats = 8

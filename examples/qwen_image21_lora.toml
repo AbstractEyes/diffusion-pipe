@@ -3,8 +3,9 @@
 # (diffusion_models/, vae/, text_encoders/); set the absolute paths where they were downloaded.
 # The weights are under the Qwen Research License (research and evaluation only).
 
-output_dir = '/content/runs/qwen_image21_lora'
-dataset = 'examples/qwen_image21_parquet_dataset.toml'
+output_dir = '/content/runs/qwen_image21_mega_liminal_lora'
+dataset = 'examples/qwen_image21_mega_liminal_dataset.toml'
+# Or a parquet dataset with a subject-bucketing manifest: examples/qwen_image21_parquet_dataset.toml
 
 epochs = 4
 micro_batch_size_per_gpu = 4
